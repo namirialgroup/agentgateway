@@ -77,7 +77,10 @@ fn fireworks_style_stream() -> String {
 async fn run_passthrough(input: String) -> LLMInfo {
 	let captured = captured_info();
 	let _ = passthrough_stream(
-		Body::from(input.into_bytes()),
+		// Signature-agnostic across Body generations (axum_core ↔ agent_http):
+		// both impl From<Vec<u8>>, the concrete type is inferred from the
+		// passthrough_stream parameter.
+		input.into_bytes().into(),
 		1024 * 1024,
 		StreamingUsageGuard::new(Box::new(Capture(captured.clone()))),
 		LogContentFields {
@@ -412,4 +415,31 @@ async fn translate_stream_delta_without_cache_fields_builds_cache_aware_usage() 
 	assert_eq!(usage["completion_tokens"], 20);
 	assert_eq!(usage["total_tokens"], 8 + 2048 + 20);
 	assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 2048);
+}
+
+/// Prompt-caching wire shape: real non-zero cache_read/cache_creation counts
+/// in the final `message_delta` are positive evidence and must flow through
+/// the extraction untouched, alongside normal non-zero input/output counts.
+#[tokio::test]
+async fn passthrough_stream_cache_usage_is_preserved() {
+	let events = [
+		r#"{"type":"message_start","message":{"id":"msg_3","type":"message","role":"assistant","model":"accounts/fireworks/models/kimi-k3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+		r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+		r#"{"type":"content_block_stop","index":0}"#,
+		r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":200,"output_tokens":32,"cache_creation_input_tokens":128,"cache_read_input_tokens":512}}"#,
+		r#"{"type":"message_stop"}"#,
+	];
+	let input: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(200));
+	assert_eq!(info.response.output_tokens, Some(32));
+	assert_eq!(
+		info.response.cached_input_tokens, Some(512),
+		"cache_read evidence must survive extraction"
+	);
+	assert_eq!(
+		info.response.cache_creation_input_tokens, Some(128),
+		"cache_creation evidence must survive extraction"
+	);
 }

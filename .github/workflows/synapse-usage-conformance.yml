@@ -1,0 +1,84 @@
+# Synapse AgentGateway usage-conformance gate — ENFORCED variant.
+#
+# Every candidate that can become a production agentgateway image MUST pass
+# this workflow. The infra repo (namirialgroup/synapse-infra) runs the same
+# gate on any PR that touches infrastructure/prod/agentgateway/**, and the
+# release branch below is protected with this check as REQUIRED — a failing
+# candidate cannot be merged, built into a release branch, or promoted.
+#
+# Invariant (docs/synapse-usage-conformance.md):
+#   AgentGateway upgrade candidate -> usage conformance -> PASS -> eligible
+#   No upgrade may silently regress to: missing usage -> explicit 0 -> fake $0.
+name: synapse-usage-conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: "AgentGateway candidate ref (branch/tag/sha) to gate"
+        required: false
+        default: "fix/claude-messages-usage-placeholder"
+  push:
+    branches:
+      - "fix/claude-messages-usage-placeholder"
+      - "synapse/usage-conformance-gate"
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: usage-conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gate (golden tests + runner)
+        uses: actions/checkout@v4
+        with:
+          ref: synapse/usage-conformance-gate
+          path: gate
+
+      - name: Resolve candidate ref
+        id: cand
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.candidate_ref }}" ]; then
+            echo "ref=${{ github.event.inputs.candidate_ref }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=fix/claude-messages-usage-placeholder" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.cand.outputs.ref }}
+          path: candidate
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: usage-conformance-${{ runner.os }}-${{ hashFiles('candidate/Cargo.lock') }}
+          restore-keys: |
+            usage-conformance-${{ runner.os }}-
+
+      - name: Run Synapse usage-conformance gate
+        id: gate
+        working-directory: gate
+        run: |
+          set -euo pipefail
+          export AGW_GATE_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          ./scripts/synapse-usage-conformance-gate.sh "$GITHUB_WORKSPACE/candidate"
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-conformance-logs
+          path: |
+            /tmp/agw-gate-tier1.log
+            /tmp/agw-gate-tier2.log
+          if-no-files-found: ignore
