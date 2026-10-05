@@ -2934,7 +2934,9 @@ impl AIProvider {
 	/// translated client-format response. Only usage fields move: content,
 	/// tool calls, and the client-facing model stay with the translated
 	/// response. A `None` dimension clears a protocol-mandated placeholder
-	/// (missing upstream usage is unknown, never zero).
+	/// (missing upstream usage is unknown, never zero); `usage_complete`
+	/// moves too, so completeness reflects the NATIVE evidence rather than
+	/// the translated shape.
 	fn overlay_upstream_usage(llm_resp: &mut LLMResponse, native: LLMResponse) {
 		llm_resp.input_tokens = native.input_tokens;
 		llm_resp.output_tokens = native.output_tokens;
@@ -2945,6 +2947,7 @@ impl AIProvider {
 		llm_resp.input_audio_tokens = native.input_audio_tokens;
 		llm_resp.output_audio_tokens = native.output_audio_tokens;
 		llm_resp.service_tier = native.service_tier;
+		llm_resp.usage_complete = native.usage_complete;
 	}
 
 	/// True when the client-facing chat shape differs from the upstream wire

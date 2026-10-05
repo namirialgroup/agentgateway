@@ -801,6 +801,9 @@ pub mod from_completions {
 								message.usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								message.usage.cache_creation_input_tokens.map(|i| i as u64);
+							// Provisional evidence: the cumulative totals only
+							// arrive on the terminal `message_delta`.
+							r.response.usage_complete = Some(false);
 						}
 						r.response.service_tier = message.usage.service_tier.as_deref().map(Into::into);
 						r.response.provider_model = Some(strng::new(&message.model))
@@ -922,6 +925,13 @@ pub mod from_completions {
 						.stop_reason
 						.as_ref()
 						.and_then(crate::types::serialize_str);
+					// The terminal `message_delta` usage is cumulative-final
+					// per the Anthropic streaming protocol; a delta that
+					// carries usage therefore finalizes every dimension.
+					let delta_usage = usage.input_tokens.is_some()
+						|| usage.output_tokens.is_some()
+						|| usage.cache_read_input_tokens.is_some()
+						|| usage.cache_creation_input_tokens.is_some();
 					log.update(|r| {
 						if let Some(inp) = usage.input_tokens {
 							r.response.input_tokens = Some(inp as u64);
@@ -934,6 +944,9 @@ pub mod from_completions {
 						}
 						if let Some(o) = usage.output_tokens {
 							r.response.output_tokens = Some(o as u64);
+						}
+						if delta_usage {
+							r.response.usage_complete = Some(true);
 						}
 						if let Some(inp) = r.response.input_tokens
 							&& let Some(o) = r.response.output_tokens
@@ -1172,6 +1185,9 @@ pub fn passthrough_stream(
 							message.usage.cache_read_input_tokens.map(|i| i as u64);
 						r.response.cache_creation_input_tokens =
 							message.usage.cache_creation_input_tokens.map(|i| i as u64);
+						// Provisional evidence: the cumulative totals only
+						// arrive on the terminal `message_delta`.
+						r.response.usage_complete = Some(false);
 					}
 					r.response.service_tier = message.usage.service_tier.as_deref().map(Into::into);
 					r.response.provider_model = Some(strng::new(&message.model))
@@ -1215,18 +1231,28 @@ pub fn passthrough_stream(
 					.stop_reason
 					.as_ref()
 					.and_then(crate::types::serialize_str);
+				// The terminal `message_delta` usage is cumulative-final
+				// per the Anthropic streaming protocol; a delta that
+				// carries usage therefore finalizes every dimension.
+				let delta_usage = usage.input_tokens.is_some()
+					|| usage.output_tokens.is_some()
+					|| usage.cache_read_input_tokens.is_some()
+					|| usage.cache_creation_input_tokens.is_some();
 				log.update(|r| {
 					if let Some(inp) = usage.input_tokens {
 						r.response.input_tokens = Some(inp as u64);
-					}
-					if let Some(o) = usage.output_tokens {
-						r.response.output_tokens = Some(o as u64);
 					}
 					if let Some(crt) = usage.cache_read_input_tokens {
 						r.response.cached_input_tokens = Some(crt as u64);
 					}
 					if let Some(cwt) = usage.cache_creation_input_tokens {
 						r.response.cache_creation_input_tokens = Some(cwt as u64);
+					}
+					if let Some(o) = usage.output_tokens {
+						r.response.output_tokens = Some(o as u64);
+					}
+					if delta_usage {
+						r.response.usage_complete = Some(true);
 					}
 					if let Some(inp) = r.response.input_tokens
 						&& let Some(o) = r.response.output_tokens

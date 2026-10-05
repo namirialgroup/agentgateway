@@ -48,6 +48,12 @@ fn native_upstream_usage_missing_is_unknown_never_zero() {
 	assert_eq!(native.total_tokens, None);
 	assert_eq!(native.cached_input_tokens, None);
 	assert_eq!(native.cache_creation_input_tokens, None);
+	// No usage evidence: completeness must stay untracked — a successful
+	// response without counters is "unknown", not "complete".
+	assert_eq!(
+		native.usage_complete, None,
+		"no counts means no completeness claim"
+	);
 }
 
 /// A garbage body must not break request processing: the overlay is
@@ -73,6 +79,7 @@ fn overlay_moves_usage_only() {
 		input_tokens: Some(91),
 		output_tokens: Some(16),
 		total_tokens: Some(107),
+		usage_complete: Some(true),
 		..Default::default()
 	};
 	AIProvider::overlay_upstream_usage(&mut translated, native);
@@ -83,6 +90,29 @@ fn overlay_moves_usage_only() {
 		translated.provider_model.as_deref(),
 		Some("client-visible-model")
 	);
+	assert_eq!(
+		translated.usage_complete,
+		Some(true),
+		"completeness follows the native evidence, not the translated shape"
+	);
+}
+
+/// Cross-format translation where the upstream reported NO usage: the
+/// overlay clears the placeholder counts AND drops the translated
+/// response's own `usage_complete` — no native evidence, no claim.
+#[test]
+fn overlay_without_native_usage_drops_completeness() {
+	let mut translated = super::LLMResponse {
+		input_tokens: Some(0),
+		output_tokens: Some(0),
+		usage_complete: Some(true),
+		..Default::default()
+	};
+	let native = super::LLMResponse::default();
+	AIProvider::overlay_upstream_usage(&mut translated, native);
+	assert_eq!(translated.input_tokens, None);
+	assert_eq!(translated.output_tokens, None);
+	assert_eq!(translated.usage_complete, None);
 }
 
 /// Only true cross-format pairs need the overlay; native passthrough pairs
@@ -136,6 +166,8 @@ fn native_upstream_anthropic_cache_only_usage_is_evidence() {
 	assert_eq!(native.total_tokens, Some(5));
 	assert_eq!(native.cached_input_tokens, Some(2048));
 	assert_eq!(native.cache_creation_input_tokens, Some(512));
+	// Buffered bodies are complete by construction: usage from them is final.
+	assert_eq!(native.usage_complete, Some(true));
 }
 
 /// The native recovery exists only to overlay usage dimensions; it must not

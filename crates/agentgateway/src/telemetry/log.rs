@@ -1878,6 +1878,20 @@ impl Drop for DropOnLog {
 						.and_then(|l| l.output_tokens)
 						.map(Into::into),
 				),
+				// Not part of official semconv: marks whether the usage
+				// counts are final/cumulative ("true") or provisional
+				// stream evidence ("false"); absent when usage is
+				// unknown/untracked (see LLMResponse::usage_complete).
+				// Encoded as an explicit string: the attribute pipeline
+				// stringifies ValueBag bools anyway, and "false" must
+				// never be confused with absence.
+				(
+					"agw.ai.usage.complete",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.usage_complete)
+						.map(|complete| ValueBag::from(if complete { "true" } else { "false" })),
+				),
 				// Not part of official semconv
 				(
 					"gen_ai.usage.reasoning_tokens",
@@ -3669,6 +3683,76 @@ mod tests {
 			value("gen_ai.usage.output_audio_tokens"),
 			Some(&opentelemetry::Value::I64(4))
 		);
+	}
+
+	#[test]
+	fn llm_span_usage_completeness_follows_the_evidence() {
+		let request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::Messages,
+			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+			request_model: strng::literal!("claude"),
+			provider: strng::literal!("anthropic"),
+			streaming: true,
+			params: llm::LLMRequestParams::default(),
+			prompt: None,
+			provider_state: None,
+		};
+
+		let completeness = |response: llm::LLMResponse| -> Option<bool> {
+			let (tracer, exporter) = test_tracer();
+			let mut log = test_request_log();
+			log.tracer = Some(tracer.clone());
+			let mut outgoing = trc::TraceParent::new();
+			outgoing.flags = 1;
+			log.outgoing_span = Some(outgoing);
+			log.llm_request = Some(request.clone());
+			log
+				.llm_response
+				.store(Some(llm::LLMInfo::new(request.clone(), response)));
+			drop(DropOnLog::from(log));
+			let _ = tracer.provider.force_flush();
+			let spans = exporter.finished_spans();
+			let span = spans
+				.iter()
+				.find(|span| span.name.as_ref() == "unknown")
+				.expect("request span should be exported");
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == "agw.ai.usage.complete")
+				.map(|attr| match &attr.value {
+					opentelemetry::Value::String(v) => match v.as_str() {
+						"true" => true,
+						"false" => false,
+						other => panic!("unexpected attribute value: {other}"),
+					},
+					other => panic!("unexpected attribute value: {other:?}"),
+				})
+		};
+
+		// Terminal cumulative usage arrived: final.
+		assert_eq!(
+			completeness(llm::LLMResponse {
+				input_tokens: Some(27),
+				output_tokens: Some(403),
+				usage_complete: Some(true),
+				..Default::default()
+			}),
+			Some(true)
+		);
+		// Provisional stream evidence without the terminal update: partial.
+		assert_eq!(
+			completeness(llm::LLMResponse {
+				input_tokens: Some(27),
+				output_tokens: Some(1),
+				usage_complete: Some(false),
+				..Default::default()
+			}),
+			Some(false)
+		);
+		// No usage evidence: the attribute is absent entirely (unknown).
+		assert_eq!(completeness(llm::LLMResponse::default()), None);
 	}
 
 	#[tokio::test]

@@ -115,6 +115,11 @@ async fn passthrough_stream_final_usage_overrides_message_start_placeholder() {
 	);
 	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
 	assert_eq!(
+		info.response.usage_complete,
+		Some(true),
+		"message_delta usage is cumulative-final"
+	);
+	assert_eq!(
 		info.response.provider_model.as_deref(),
 		Some("accounts/fireworks/models/kimi-k3")
 	);
@@ -141,6 +146,10 @@ async fn passthrough_stream_message_delta_without_usage_leaves_no_zero_fabricati
 		"message_start placeholder zeros must not become final usage evidence"
 	);
 	assert_eq!(info.response.output_tokens, None);
+	assert_eq!(
+		info.response.usage_complete, None,
+		"no usage evidence at all: completeness stays untracked, not falsely final"
+	);
 }
 
 fn message_start_with_usage(usage_json: &str) -> String {
@@ -173,6 +182,39 @@ async fn passthrough_stream_fully_cached_message_start_keeps_cache_read_evidence
 	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
 	assert_eq!(info.response.input_tokens, Some(0));
 	assert_eq!(info.response.output_tokens, Some(0));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(false),
+		"real evidence observed, but no cumulative update arrived"
+	);
+}
+
+/// REPRODUCTION of the v1.6.0 field report: `message_start` carries
+/// legitimate non-zero provisional usage (input=27, output=1 — native
+/// Anthropic reports the prompt count plus a provisional output count of 1
+/// here), content streams, and the final cumulative `message_delta` usage
+/// never arrives because the stream does not terminate cleanly. The
+/// provisional counts are real observations and must be preserved, but the
+/// gateway currently records nothing that distinguishes this state from a
+/// complete stream — downstream accounting cannot tell final from
+/// provisional.
+#[tokio::test]
+async fn passthrough_stream_nonzero_provisional_usage_without_final_update() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(r#"{"input_tokens":27,"output_tokens":1}"#),
+		r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"provisional"}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(27));
+	assert_eq!(info.response.output_tokens, Some(1));
+	// The provider billed at least the prompt; the observed counts are
+	// retained, and `usage_complete = Some(false)` marks them provisional
+	// so accounting consumers never mistake them for invoice-authoritative
+	// totals.
+	assert_eq!(info.response.usage_complete, Some(false));
 }
 
 /// Same fully-cached shape, but the prompt WROTE a new cache entry
@@ -194,6 +236,7 @@ async fn passthrough_stream_fully_cached_message_start_keeps_cache_creation_evid
 	);
 	assert_eq!(info.response.input_tokens, Some(0));
 	assert_eq!(info.response.output_tokens, Some(0));
+	assert_eq!(info.response.usage_complete, Some(false));
 }
 
 /// A `message_delta` that reports only the token counts and does NOT repeat
@@ -218,6 +261,7 @@ async fn passthrough_stream_delta_without_cache_fields_keeps_message_start_cache
 		"cache evidence from message_start must survive a cache-less delta"
 	);
 	assert_eq!(info.response.total_tokens, Some(28));
+	assert_eq!(info.response.usage_complete, Some(true));
 }
 
 /// A `message_start` with regular non-zero token usage and no later
@@ -232,6 +276,47 @@ async fn passthrough_stream_nonzero_message_start_usage_is_evidence() {
 	let info = run_passthrough(input).await;
 	assert_eq!(info.response.input_tokens, Some(91));
 	assert_eq!(info.response.output_tokens, Some(1));
+	assert_eq!(info.response.usage_complete, Some(false));
+}
+
+/// The field report WITH its happy ending: the provisional 27/1 counts are
+/// replaced by the terminal `message_delta` cumulative usage (output grew
+/// 1 → 403), and the completeness flag flips to final.
+#[tokio::test]
+async fn passthrough_stream_final_usage_replaces_provisional_counts() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(r#"{"input_tokens":27,"output_tokens":1}"#),
+		r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":27,"output_tokens":403}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(27));
+	assert_eq!(info.response.output_tokens, Some(403));
+	assert_eq!(info.response.total_tokens, Some(430));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(true),
+		"the terminal cumulative update finalizes the provisional counts"
+	);
+}
+
+/// Buffered responses carry the FINAL usage of a complete body by
+/// construction: the completeness contract holds without any stream state.
+#[test]
+fn buffered_response_usage_is_complete() {
+	use crate::types::ResponseType;
+	use crate::types::messages::typed::MessagesResponse;
+
+	let body: MessagesResponse = serde_json::from_str(
+		r#"{"id":"msg_b","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":27,"output_tokens":403,"cache_read_input_tokens":10}}"#,
+	)
+	.expect("valid messages response");
+	let resp = body.to_llm_response(LogContentFields::USAGE_ONLY);
+	assert_eq!(resp.input_tokens, Some(27));
+	assert_eq!(resp.output_tokens, Some(403));
+	assert_eq!(resp.usage_complete, Some(true));
 }
 
 /// Drive the Messages→completions streaming translation (the cross-format
@@ -273,6 +358,11 @@ async fn translate_stream_fully_cached_message_start_keeps_cache_evidence() {
 	assert_eq!(info.response.cached_input_tokens, Some(2048));
 	assert_eq!(info.response.input_tokens, Some(0));
 	assert_eq!(info.response.output_tokens, Some(0));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(false),
+		"translation path: message_start evidence without message_delta is provisional"
+	);
 	assert!(
 		!String::from_utf8_lossy(&out).contains("prompt_tokens"),
 		"no usage chunk is synthesized for the client without a message_delta"
@@ -300,6 +390,11 @@ async fn translate_stream_delta_without_cache_fields_builds_cache_aware_usage() 
 	assert_eq!(info.response.output_tokens, Some(20));
 	assert_eq!(info.response.cached_input_tokens, Some(2048));
 	assert_eq!(info.response.total_tokens, Some(28));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(true),
+		"translation path: message_delta usage is cumulative-final"
+	);
 
 	let out_str = String::from_utf8_lossy(&out).into_owned();
 	let usage_chunk = out_str

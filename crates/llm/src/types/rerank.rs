@@ -158,6 +158,7 @@ impl crate::types::ResponseType for Response {
 				})
 		});
 		crate::LLMResponse {
+			usage_complete: input_tokens.is_some().then_some(true),
 			input_tokens,
 			total_tokens: input_tokens,
 			..Default::default()
