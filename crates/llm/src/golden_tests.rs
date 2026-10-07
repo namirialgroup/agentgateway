@@ -956,6 +956,10 @@ mod responses {
 		("response/vertex/embed-content.json", VERTEX_EMBED_CONTENT),
 		("response/openai/embeddings.json", OPENAI),
 		("response/openai/gemini-embeddings.json", OPENAI),
+		// Voyage's embeddings API reports usage.total_tokens WITHOUT
+		// prompt_tokens — the parser must accept it and derive the input
+		// usage from the aggregate (do NOT undercount as 0).
+		("response/openai/voyage-embeddings.json", OPENAI),
 	];
 	const RERANK_RESPONSES: &[(&str, &str)] = &[
 		("response/bedrock/rerank.json", BEDROCK),

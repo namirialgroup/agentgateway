@@ -18,7 +18,12 @@ pub struct Response {
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Usage {
-	pub prompt_tokens: u32,
+	/// Providers report this inconsistently: OpenAI-compatible APIs always
+	/// send it, but e.g. Voyage's embeddings API reports only `total_tokens`.
+	/// Absent → derived from `total_tokens` for internal usage accounting,
+	/// and NOT fabricated back into the client response.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_tokens: Option<u32>,
 	pub total_tokens: u32,
 	#[serde(flatten, default)]
 	pub rest: serde_json::Value,
@@ -118,7 +123,14 @@ impl crate::types::ResponseType for Response {
 	fn to_llm_response(&self, _log_content: crate::LogContentFields) -> crate::LLMResponse {
 		crate::LLMResponse {
 			usage_complete: self.usage.is_some().then_some(true),
-			input_tokens: self.usage.as_ref().map(|u| u.prompt_tokens as u64),
+			// Embeddings never emit output tokens; when the provider reports
+			// only an aggregate count (e.g. Voyage), the whole usage IS the
+			// input usage — fall back to total_tokens rather than undercounting
+			// as 0 (usage/cost accounting depends on this).
+			input_tokens: self
+				.usage
+				.as_ref()
+				.map(|u| u.prompt_tokens.unwrap_or(u.total_tokens) as u64),
 			input_image_tokens: None,
 			input_text_tokens: None,
 			input_audio_tokens: None,

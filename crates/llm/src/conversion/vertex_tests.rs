@@ -48,7 +48,7 @@ fn test_embeddings_response_missing_statistics() {
 		.and_then(|b| serde_json::from_slice::<types::embeddings::Response>(&b))
 		.unwrap();
 
-	assert_eq!(resp.usage.unwrap().prompt_tokens, 0);
+	assert_eq!(resp.usage.unwrap().prompt_tokens, Some(0));
 }
 
 #[test]
@@ -110,5 +110,5 @@ fn test_embed_content_response_missing_usage_metadata() {
 		.and_then(|b| serde_json::from_slice::<types::embeddings::Response>(&b))
 		.unwrap();
 
-	assert_eq!(resp.usage.unwrap().prompt_tokens, 0);
+	assert_eq!(resp.usage.unwrap().prompt_tokens, Some(0));
 }
