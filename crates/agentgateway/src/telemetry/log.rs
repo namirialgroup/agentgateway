@@ -1864,6 +1864,25 @@ impl Drop for DropOnLog {
 						.and_then(|l| l.cache_creation_input_tokens)
 						.map(Into::into),
 				),
+				// Per-TTL cache-write split (Accounting consumer contract —
+				// synapse-runtime accounting-tap `cache_write_5m/1h_tokens`).
+				// Absent (None) = the provider reported no split; the tap
+				// leaves the classes unknown and downstream settlement fails
+				// closed on ambiguous aggregates rather than approximating.
+				(
+					"gen_ai.usage.cache_creation.input_tokens.5m",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.cache_creation_5m_input_tokens)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.usage.cache_creation.input_tokens.1h",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.cache_creation_1h_input_tokens)
+						.map(Into::into),
+				),
 				(
 					"gen_ai.usage.cache_read.input_tokens",
 					llm_response
@@ -3609,6 +3628,121 @@ mod tests {
 	}
 
 	#[test]
+	/// The per-TTL cache-write split reaches the span attributes exactly as
+	/// reported (Accounting tap contract `cache_write_5m/1h_tokens`); an
+	/// aggregate-only response leaves the split attributes absent — never
+	/// zero, never inferred.
+	#[test]
+	fn llm_span_emits_cache_write_ttl_split_attributes() {
+		let request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::Messages,
+			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+			request_model: strng::literal!("claude"),
+			provider: strng::literal!("bedrock"),
+			streaming: false,
+			params: llm::LLMRequestParams::default(),
+			prompt: None,
+			provider_state: None,
+		};
+		let split = llm::LLMResponse {
+			input_tokens: Some(50),
+			cache_creation_input_tokens: Some(300),
+			cache_creation_5m_input_tokens: Some(200),
+			cache_creation_1h_input_tokens: Some(100),
+			output_tokens: Some(20),
+			total_tokens: Some(370),
+			..Default::default()
+		};
+		let aggregate_only = llm::LLMResponse {
+			input_tokens: Some(50),
+			cache_creation_input_tokens: Some(300),
+			output_tokens: Some(20),
+			total_tokens: Some(370),
+			..Default::default()
+		};
+
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request.clone(), split)));
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| &attr.value)
+		};
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens.5m"),
+			Some(&opentelemetry::Value::I64(200))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens.1h"),
+			Some(&opentelemetry::Value::I64(100))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens"),
+			Some(&opentelemetry::Value::I64(300))
+		);
+
+		// Aggregate-only producer: split attributes ABSENT, aggregate intact.
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request);
+		log.llm_response.store(Some(llm::LLMInfo::new(
+			llm::LLMRequest {
+				input_tokens: None,
+				input_format: InputFormat::Messages,
+				cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+				request_model: strng::literal!("claude"),
+				provider: strng::literal!("bedrock"),
+				streaming: false,
+				params: llm::LLMRequestParams::default(),
+				prompt: None,
+				provider_state: None,
+			},
+			aggregate_only,
+		)));
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| &attr.value)
+		};
+		assert_eq!(value("gen_ai.usage.cache_creation.input_tokens.5m"), None);
+		assert_eq!(value("gen_ai.usage.cache_creation.input_tokens.1h"), None);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens"),
+			Some(&opentelemetry::Value::I64(300))
+		);
+	}
+
 	fn llm_span_uses_cache_inclusive_input_tokens() {
 		let request = llm::LLMRequest {
 			input_tokens: None,

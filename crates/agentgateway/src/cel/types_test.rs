@@ -140,6 +140,8 @@ fn build_test_request() -> crate::http::Request {
 		count_tokens: None,
 		reasoning_tokens: None,
 		cache_creation_input_tokens: None,
+		cache_creation_5m_input_tokens: None,
+		cache_creation_1h_input_tokens: None,
 		cached_input_tokens: None,
 		prompt: None,
 		completion: Some(vec!["Hello world".to_string()]),

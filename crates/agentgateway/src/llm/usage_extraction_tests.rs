@@ -188,3 +188,31 @@ fn native_upstream_extraction_is_usage_only() {
 		"usage-only conversion must not extract tool-call output"
 	);
 }
+
+/// Anthropic-native responses carry the per-TTL cache-write split in
+/// `usage.cache_creation.ephemeral_5m/1h_input_tokens`. The extraction must
+/// surface it for accounting (exact 5m/1h metering) while the client-facing
+/// wire stays untouched.
+#[test]
+fn native_upstream_anthropic_cache_ttl_split_is_extracted() {
+	let bytes = Bytes::from(
+		r#"{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":100,"output_tokens":5,"cache_creation_input_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100},"cache_read_input_tokens":64}}"#,
+	);
+	let native = AIProvider::native_upstream_llm_response(ChatFormat::AnthropicMessages, &bytes)
+		.expect("native parse");
+	assert_eq!(native.cache_creation_input_tokens, Some(300));
+	assert_eq!(native.cache_creation_5m_input_tokens, Some(200));
+	assert_eq!(native.cache_creation_1h_input_tokens, Some(100));
+
+	// Aggregate-only (older provider response shape): split stays unknown —
+	// never inferred from the aggregate, never zero.
+	let aggregate_only = Bytes::from(
+		r#"{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":100,"output_tokens":5,"cache_creation_input_tokens":300}}"#,
+	);
+	let native =
+		AIProvider::native_upstream_llm_response(ChatFormat::AnthropicMessages, &aggregate_only)
+			.expect("native parse");
+	assert_eq!(native.cache_creation_input_tokens, Some(300));
+	assert_eq!(native.cache_creation_5m_input_tokens, None);
+	assert_eq!(native.cache_creation_1h_input_tokens, None);
+}

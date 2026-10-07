@@ -2943,6 +2943,8 @@ impl AIProvider {
 		llm_resp.total_tokens = native.total_tokens;
 		llm_resp.cached_input_tokens = native.cached_input_tokens;
 		llm_resp.cache_creation_input_tokens = native.cache_creation_input_tokens;
+		llm_resp.cache_creation_5m_input_tokens = native.cache_creation_5m_input_tokens;
+		llm_resp.cache_creation_1h_input_tokens = native.cache_creation_1h_input_tokens;
 		llm_resp.reasoning_tokens = native.reasoning_tokens;
 		llm_resp.input_audio_tokens = native.input_audio_tokens;
 		llm_resp.output_audio_tokens = native.output_audio_tokens;
