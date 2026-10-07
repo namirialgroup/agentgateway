@@ -398,6 +398,26 @@ pub struct LLMResponse {
 	pub cached_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub service_tier: Option<Strng>,
+	/// Whether the observed usage counts are TERMINAL evidence, i.e. known
+	/// to be final/cumulative — not merely "the response completed". Some
+	/// providers (e.g. Anthropic-compatible upstreams) report provisional
+	/// per-event counts (`message_start`) and the cumulative totals only in
+	/// the terminal update (`message_delta`); a stream that does not
+	/// terminate cleanly therefore leaves observed counts that are real
+	/// evidence but not invoice-authoritative. Tri-state:
+	/// - `Some(true)`: counts are present AND known final — buffered
+	///   responses with usage by construction, streams via the terminal
+	///   cumulative usage event.
+	/// - `Some(false)`: counts are present but only provisional stream
+	///   evidence; no terminal cumulative update arrived.
+	/// - `None`: no usage evidence at all, or a streaming format without
+	///   a distinct final-usage event (not tracked).
+	///
+	/// Internal telemetry metadata: deliberately NOT serialized — it is
+	/// exposed via OTLP (`agw.ai.usage.complete`) and CEL
+	/// (`llm.usageComplete`) instead of the serialized response shape.
+	#[serde(skip)]
+	pub usage_complete: Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub provider_model: Option<Strng>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -477,6 +497,16 @@ pub struct LogContentFields {
 	pub completion: bool,
 	/// Whether to capture tool/function calls as structured output messages.
 	pub tool_calls: bool,
+}
+
+impl LogContentFields {
+	/// Capture no content at all. For usage-only conversions: callers that
+	/// reduce the resulting [`LLMResponse`] to its usage dimensions and
+	/// discard the completion text and tool-call output.
+	pub const USAGE_ONLY: Self = Self {
+		completion: false,
+		tool_calls: false,
+	};
 }
 
 pub trait StreamingUsageReporter: Send {

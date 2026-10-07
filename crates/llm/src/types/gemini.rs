@@ -544,6 +544,7 @@ impl ResponseType for Response {
 		let um = self.0.usage_metadata.as_ref();
 		let counts = um.map(vg::UsageMetadata::counts);
 		LLMResponse {
+			usage_complete: counts.is_some().then_some(true),
 			input_tokens: counts.map(|c| c.0),
 			output_tokens: counts.map(|c| c.1),
 			total_tokens: counts.map(|c| c.2),

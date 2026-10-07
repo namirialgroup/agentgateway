@@ -1,0 +1,39 @@
+---
+source: crates/llm/src/golden_tests.rs
+description: src/tests/response/openai/voyage-embeddings.json
+info:
+  object: list
+  data:
+    - object: embedding
+      index: 0
+      embedding:
+        - 0.1
+        - 0.2
+  model: voyage-4
+  usage:
+    total_tokens: 1
+---
+{
+  "response": {
+    "object": "list",
+    "model": "voyage-4",
+    "usage": {
+      "total_tokens": 1
+    },
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.1,
+          0.2
+        ]
+      }
+    ]
+  },
+  "parsed": {
+    "input_tokens": 1,
+    "total_tokens": 1,
+    "provider_model": "voyage-4"
+  }
+}

@@ -811,6 +811,7 @@ impl ResponseType for Response {
 		};
 
 		LLMResponse {
+			usage_complete: self.usage.is_some().then_some(true),
 			input_tokens: self.usage.as_ref().map(|u| u.input_tokens),
 			input_image_tokens: None,
 			input_text_tokens: None,

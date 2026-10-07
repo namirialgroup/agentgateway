@@ -1554,6 +1554,11 @@ pub struct LLMContext {
 	#[dynamic(rename = "serviceTier")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub service_tier: Option<Strng>,
+	/// Whether the usage counts are final/cumulative rather than provisional
+	/// stream evidence. See `llm::LLMResponse::usage_complete`.
+	#[dynamic(rename = "usageComplete")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub usage_complete: Option<bool>,
 	// For now, not exposed to CEL; only used to piggy-back this field for metrics.
 	#[serde(skip)]
 	#[dynamic(skip)]
@@ -1630,6 +1635,7 @@ impl LLMContext {
 			cached_input_tokens: resp.cached_input_tokens,
 			cache_creation_input_tokens: resp.cache_creation_input_tokens,
 			service_tier: resp.service_tier,
+			usage_complete: resp.usage_complete,
 			response_model: resp.provider_model,
 			// Not always set
 			completion: resp.completion,
@@ -1717,6 +1723,8 @@ impl From<llm::LLMRequest> for LLMContext {
 			provider_input_tokens: None,
 			params,
 			prompt,
+
+			usage_complete: None,
 
 			first_token: None,
 			inter_chunk_latencies: llm::TokenGapSummary::default(),
@@ -2453,6 +2461,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			total_tokens: Some(150),
 			provider_total_tokens: Some(150),
 			service_tier: Some("default".into()),
+			usage_complete: Some(true),
 			first_token: None,
 			inter_chunk_latencies: llm::TokenGapSummary::default(),
 			time_to_first_token: Some(chrono::Duration::milliseconds(123).into()),

@@ -603,6 +603,8 @@ impl ResponseType for Response {
 		let output_tokens = self.lookup(lookups::USAGE_OUTPUT_TOKENS, |v| v.as_u64());
 		let total_tokens = self.lookup(lookups::USAGE_TOTAL_TOKENS, |v| v.as_u64());
 		crate::LLMResponse {
+			usage_complete: (input_tokens.is_some() || output_tokens.is_some() || total_tokens.is_some())
+				.then_some(true),
 			count_tokens: None, // We never tokenize these, so always empty
 			input_tokens,
 			input_image_tokens: self.lookup(lookups::INPUT_IMAGE_TOKENS, |v| v.as_u64()),

@@ -71,6 +71,9 @@ impl<IO> Parser<IO> {
 						output_audio_tokens: None,
 						total_tokens: Some(usage.total_tokens as u64),
 						service_tier: None,
+						// `response.done` is the terminal Realtime event:
+						// usage is final.
+						usage_complete: Some(true),
 						provider_model: None,
 						completion: None,
 						output_messages: None,
@@ -556,6 +559,9 @@ pub async fn guarded_realtime_proxy<C, S>(
 												output_audio_tokens: None,
 												total_tokens: Some(usage_clone.total_tokens as u64),
 												service_tier: None,
+												// `response.done` is the terminal
+												// Realtime event: usage is final.
+												usage_complete: Some(true),
 												provider_model: None,
 												completion: None,
 												output_messages: None,
