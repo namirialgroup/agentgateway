@@ -435,11 +435,13 @@ async fn passthrough_stream_cache_usage_is_preserved() {
 	assert_eq!(info.response.input_tokens, Some(200));
 	assert_eq!(info.response.output_tokens, Some(32));
 	assert_eq!(
-		info.response.cached_input_tokens, Some(512),
+		info.response.cached_input_tokens,
+		Some(512),
 		"cache_read evidence must survive extraction"
 	);
 	assert_eq!(
-		info.response.cache_creation_input_tokens, Some(128),
+		info.response.cache_creation_input_tokens,
+		Some(128),
 		"cache_creation evidence must survive extraction"
 	);
 }
