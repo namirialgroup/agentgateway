@@ -2124,6 +2124,7 @@ pub mod from_messages {
 								cache_creation_input_tokens: None,
 								cache_read_input_tokens: None,
 								service_tier: None,
+								cache_creation: None,
 							},
 							input_audio_tokens: None,
 							output_audio_tokens: None,
@@ -2356,6 +2357,9 @@ pub mod from_messages {
 			output_tokens: Some(usage.output_tokens),
 			cache_creation_input_tokens: usage.cache_write_input_tokens,
 			cache_read_input_tokens: usage.cache_read_input_tokens,
+			// Translated client wire stays as-shipped: the Bedrock split is
+			// carried by the native telemetry path, not synthesized here.
+			cache_creation: None,
 		}
 	}
 }
@@ -4372,6 +4376,7 @@ impl ConverseResponseAdapter {
 				cache_creation_input_tokens: u.cache_write_input_tokens,
 				cache_read_input_tokens: u.cache_read_input_tokens,
 				service_tier: None,
+				cache_creation: None,
 			})
 			.unwrap_or(messagest::Usage {
 				input_tokens: 0,
@@ -4379,6 +4384,7 @@ impl ConverseResponseAdapter {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier: None,
+				cache_creation: None,
 			});
 
 		Ok(messagest::MessagesResponse {

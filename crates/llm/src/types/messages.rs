@@ -1144,6 +1144,23 @@ pub mod typed {
 		/// Cumulative cache read tokens
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub cache_read_input_tokens: Option<usize>,
+		/// Per-TTL cache-write split, when the provider reports the
+		/// `usage.cache_creation` object on the cumulative delta (Anthropic
+		/// prompt caching: 5m default bucket, 1h extended bucket). Absent
+		/// means the split is unknown — never zero.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub cache_creation: Option<CacheCreationSplit>,
+	}
+
+	/// The Anthropic `usage.cache_creation` object: explicit per-TTL
+	/// buckets. A present `Some(0)` bucket is real evidence (the provider
+	/// reported the split); a missing key or object means unknown.
+	#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+	pub struct CacheCreationSplit {
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub ephemeral_5m_input_tokens: Option<usize>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub ephemeral_1h_input_tokens: Option<usize>,
 	}
 
 	#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -1218,6 +1235,12 @@ pub mod typed {
 		/// The service tier used to serve the request.
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub service_tier: Option<String>,
+
+		/// Per-TTL cache-write split, when the provider reports the
+		/// `usage.cache_creation` object (see [`CacheCreationSplit`]).
+		/// Absent means the split is unknown — never zero.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub cache_creation: Option<CacheCreationSplit>,
 	}
 
 	/// Tool definition. A client-defined custom tool always carries `input_schema` and no `type`
@@ -1517,6 +1540,7 @@ mod tests {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier: None,
+				cache_creation: None,
 			},
 			input_audio_tokens: None,
 			output_audio_tokens: None,
@@ -1576,6 +1600,7 @@ mod tests {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier: None,
+				cache_creation: None,
 			},
 			input_audio_tokens: None,
 			output_audio_tokens: None,

@@ -801,6 +801,10 @@ pub mod from_completions {
 								message.usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								message.usage.cache_creation_input_tokens.map(|i| i as u64);
+							// TTL split stays unread here — message_start usage
+							// is provisional pre-turn state; only the terminal
+							// message_delta is cumulative-final (see the
+							// passthrough MessageStart arm).
 							// Provisional evidence: the cumulative totals only
 							// arrive on the terminal `message_delta`.
 							r.response.usage_complete = Some(false);
@@ -941,6 +945,12 @@ pub mod from_completions {
 						}
 						if let Some(cwt) = usage.cache_creation_input_tokens {
 							r.response.cache_creation_input_tokens = Some(cwt as u64);
+						}
+						if let Some(split) = &usage.cache_creation {
+							r.response.cache_creation_5m_input_tokens =
+								split.ephemeral_5m_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_1h_input_tokens =
+								split.ephemeral_1h_input_tokens.map(|i| i as u64);
 						}
 						if let Some(o) = usage.output_tokens {
 							r.response.output_tokens = Some(o as u64);
@@ -1185,6 +1195,13 @@ pub fn passthrough_stream(
 							message.usage.cache_read_input_tokens.map(|i| i as u64);
 						r.response.cache_creation_input_tokens =
 							message.usage.cache_creation_input_tokens.map(|i| i as u64);
+						// NOTE: the TTL split is deliberately NOT read here.
+						// `message_start` usage is provisional pre-turn state —
+						// captured production evidence shows it reporting
+						// `cache_creation: {5m: 0, 1h: 0}` alongside a positive
+						// aggregate — while the terminal `message_delta` usage
+						// is cumulative-final. Only the delta may carry the
+						// split into evidence.
 						// Provisional evidence: the cumulative totals only
 						// arrive on the terminal `message_delta`.
 						r.response.usage_complete = Some(false);
@@ -1247,6 +1264,12 @@ pub fn passthrough_stream(
 					}
 					if let Some(cwt) = usage.cache_creation_input_tokens {
 						r.response.cache_creation_input_tokens = Some(cwt as u64);
+					}
+					if let Some(split) = &usage.cache_creation {
+						r.response.cache_creation_5m_input_tokens =
+							split.ephemeral_5m_input_tokens.map(|i| i as u64);
+						r.response.cache_creation_1h_input_tokens =
+							split.ephemeral_1h_input_tokens.map(|i| i as u64);
 					}
 					if let Some(o) = usage.output_tokens {
 						r.response.output_tokens = Some(o as u64);
