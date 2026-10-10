@@ -492,3 +492,43 @@ async fn passthrough_stream_cache_usage_is_preserved() {
 		"cache_creation evidence must survive extraction"
 	);
 }
+
+/// Captured production `message_start` shape (golden stream_basic): a
+/// small aggregate alongside an all-zero split — the provider's
+/// authoritative sub-minimum no-op write evidence. The split buckets are
+/// forwarded EXACTLY as reported (Some(0)/Some(0) — real evidence, not
+/// absence) and the terminal delta, which carries no split here, leaves
+/// that evidence untouched instead of clobbering it.
+#[tokio::test]
+async fn passthrough_stream_sub_minimum_zero_split_is_authoritative_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":15,"output_tokens":1,"cache_creation_input_tokens":13,"cache_read_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":21}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(13));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
+}
+
+/// Real Anthropic streaming shape (production canary): the input-side
+/// usage is final at `message_start` and SELF-CONSISTENT
+/// (aggregate == 5m + 1h), while the terminal delta carries no split. The
+/// consistent split becomes evidence at start and survives the delta.
+#[tokio::test]
+async fn passthrough_stream_consistent_message_start_split_becomes_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":67759,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":67759,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":44}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
+}

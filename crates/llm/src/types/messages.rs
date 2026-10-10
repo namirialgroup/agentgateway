@@ -169,6 +169,11 @@ impl Usage {
 	/// wire format stays byte-identical — no re-parsed typed field, no key
 	/// reordering. `None` = the provider reported no split; consumers must
 	/// not guess the class from the aggregate.
+	///
+	/// A reported all-zero split next to a small aggregate is the
+	/// provider's authoritative sub-minimum no-op write evidence (observed
+	/// on captured production usage): the classes are authoritative and the
+	/// residual aggregate meters at zero — not an inconsistency to hide.
 	pub fn cache_ttl_split(&self) -> (Option<u64>, Option<u64>) {
 		let cache_creation = self.rest.get("cache_creation");
 		let five_m = cache_creation

@@ -1,5 +1,6 @@
 ---
 source: crates/llm/src/golden_tests.rs
+assertion_line: 846
 description: src/tests/response/anthropic/stream_basic.json
 ---
 data: {"id":"msg_016wbjv5k86nxxd8CEZwSQnA","choices":[{"index":0,"delta":{"content":"Hi there! How are","role":"assistant"}}],"created":123,"model":"claude-haiku-4-5-20251001","service_tier":"standard","system_fingerprint":null,"object":"chat.completion.chunk","usage":null}
@@ -23,6 +24,8 @@ data: [DONE]
   "output_tokens": 21,
   "total_tokens": 36,
   "cache_creation_input_tokens": 13,
+  "cache_creation_5m_input_tokens": 0,
+  "cache_creation_1h_input_tokens": 0,
   "cached_input_tokens": 12,
   "service_tier": "standard",
   "provider_model": "claude-haiku-4-5-20251001",

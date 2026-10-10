@@ -1,5 +1,6 @@
 ---
 source: crates/llm/src/golden_tests.rs
+assertion_line: 846
 description: src/tests/response/anthropic/stream_thinking.json
 ---
 data: {"id":"msg_018XasA6jgabsibaUtstx4bg","choices":[{"index":0,"delta":{"content":null,"role":"assistant","reasoning_content":"The user is"}}],"created":123,"model":"claude-opus-4-6","service_tier":"standard","system_fingerprint":null,"object":"chat.completion.chunk","usage":null}
@@ -31,6 +32,8 @@ data: [DONE]
   "output_tokens": 264,
   "total_tokens": 311,
   "cache_creation_input_tokens": 0,
+  "cache_creation_5m_input_tokens": 0,
+  "cache_creation_1h_input_tokens": 0,
   "cached_input_tokens": 0,
   "service_tier": "standard",
   "provider_model": "claude-opus-4-6",
