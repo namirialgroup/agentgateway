@@ -170,10 +170,10 @@ impl Usage {
 	/// reordering. `None` = the provider reported no split; consumers must
 	/// not guess the class from the aggregate.
 	///
-	/// A reported all-zero split next to a small aggregate is the
-	/// provider's authoritative sub-minimum no-op write evidence (observed
-	/// on captured production usage): the classes are authoritative and the
-	/// residual aggregate meters at zero — not an inconsistency to hide.
+	/// Same documented-invariant guard as the streaming path
+	/// ([`typed::CacheCreationSplit::evidence_against`]): a split whose
+	/// buckets do not sum to this usage object's own aggregate is not
+	/// evidence and degrades to unknown — never silently zero-cost.
 	pub fn cache_ttl_split(&self) -> (Option<u64>, Option<u64>) {
 		let cache_creation = self.rest.get("cache_creation");
 		let five_m = cache_creation
@@ -182,6 +182,12 @@ impl Usage {
 		let one_h = cache_creation
 			.and_then(|c| c.get("ephemeral_1h_input_tokens"))
 			.and_then(|v| v.as_u64());
+		if five_m.is_some() || one_h.is_some() {
+			let sum = five_m.unwrap_or(0).saturating_add(one_h.unwrap_or(0));
+			if sum != self.cache_creation_input_tokens.unwrap_or(0) {
+				return (None, None);
+			}
+		}
 		(five_m, one_h)
 	}
 }
@@ -1166,6 +1172,29 @@ pub mod typed {
 		pub ephemeral_5m_input_tokens: Option<usize>,
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub ephemeral_1h_input_tokens: Option<usize>,
+	}
+
+	impl CacheCreationSplit {
+		/// Per-TTL evidence for telemetry, gated on the Anthropic documented
+		/// invariant `cache_creation_input_tokens == ephemeral_5m +
+		/// ephemeral_1h` for the SAME usage snapshot. A split that
+		/// contradicts its own aggregate is not zero-cost evidence: captured
+		/// production snapshots report `{5m: 0, 1h: 0}` next to a small
+		/// positive aggregate (sub-minimum cache markers), and reading that
+		/// as authoritative would silently unprice the residual aggregate.
+		/// A contradictory split degrades to unknown — downstream settlement
+		/// keeps failing closed on the collapsed meter instead.
+		pub fn evidence_against(&self, aggregate: Option<usize>) -> (Option<u64>, Option<u64>) {
+			let five_m = self.ephemeral_5m_input_tokens.map(|i| i as u64);
+			let one_h = self.ephemeral_1h_input_tokens.map(|i| i as u64);
+			if five_m.is_some() || one_h.is_some() {
+				let sum = five_m.unwrap_or(0).saturating_add(one_h.unwrap_or(0));
+				if sum != aggregate.unwrap_or(0) as u64 {
+					return (None, None);
+				}
+			}
+			(five_m, one_h)
+		}
 	}
 
 	#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]

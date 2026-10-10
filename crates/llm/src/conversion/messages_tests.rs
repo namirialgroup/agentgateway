@@ -494,13 +494,13 @@ async fn passthrough_stream_cache_usage_is_preserved() {
 }
 
 /// Captured production `message_start` shape (golden stream_basic): a
-/// small aggregate alongside an all-zero split — the provider's
-/// authoritative sub-minimum no-op write evidence. The split buckets are
-/// forwarded EXACTLY as reported (Some(0)/Some(0) — real evidence, not
-/// absence) and the terminal delta, which carries no split here, leaves
-/// that evidence untouched instead of clobbering it.
+/// small aggregate alongside an all-zero split. This VIOLATES the
+/// Anthropic documented invariant (aggregate == 5m + 1h) for a final
+/// snapshot, so it is not zero-cost evidence: the guard degrades the split
+/// to unknown and downstream settlement keeps failing closed on the
+/// collapsed meter instead of silently unpricing the residual aggregate.
 #[tokio::test]
-async fn passthrough_stream_sub_minimum_zero_split_is_authoritative_evidence() {
+async fn passthrough_stream_contradictory_message_start_split_degrades_to_unknown() {
 	let input = format!(
 		"{}\n\n{}\n\n",
 		message_start_with_usage(
@@ -510,8 +510,8 @@ async fn passthrough_stream_sub_minimum_zero_split_is_authoritative_evidence() {
 	);
 	let info = run_passthrough(input).await;
 	assert_eq!(info.response.cache_creation_input_tokens, Some(13));
-	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(0));
-	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, None);
+	assert_eq!(info.response.cache_creation_1h_input_tokens, None);
 }
 
 /// Real Anthropic streaming shape (production canary): the input-side
@@ -530,5 +530,40 @@ async fn passthrough_stream_consistent_message_start_split_becomes_evidence() {
 	let info = run_passthrough(input).await;
 	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
 	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
+}
+
+/// Precedence: a CONSISTENT terminal delta split wins over the
+/// message_start evidence (cumulative-final per protocol).
+#[tokio::test]
+async fn passthrough_stream_consistent_delta_split_wins_over_start() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":500,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":500,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":44,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":600,"ephemeral_1h_input_tokens":400}}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(1000));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(600));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(400));
+}
+
+/// A CONTRADICTORY delta split must NOT clobber earlier consistent
+/// evidence: the guard degrades the delta's split to unknown and the
+/// message_start evidence survives.
+#[tokio::test]
+async fn passthrough_stream_contradictory_delta_split_leaves_start_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":500,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":500,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":44,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(1000));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(500));
 	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
 }
