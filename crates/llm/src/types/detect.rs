@@ -619,6 +619,9 @@ impl ResponseType for Response {
 			reasoning_tokens: self.lookup(lookups::REASONING, |v| v.as_u64()),
 			cache_creation_input_tokens: self
 				.lookup(lookups::CACHE_CREATION_INPUT_TOKENS, |v| v.as_u64()),
+			// Raw-JSON detection has no TTL-class lookups — no split reported.
+			cache_creation_5m_input_tokens: None,
+			cache_creation_1h_input_tokens: None,
 			cached_input_tokens: self.lookup(lookups::CACHED_INPUT_TOKENS, |v| v.as_u64()),
 			service_tier: self
 				.lookup(lookups::SERVICE_TIER, |v| v.as_str())

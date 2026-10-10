@@ -307,12 +307,36 @@ fn invalid_request_error(bytes: &[u8]) -> Result<bytes::Bytes, AIError> {
 
 impl From<bedrock::TokenUsage> for super::ProviderUsage {
 	fn from(u: bedrock::TokenUsage) -> Self {
+		let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+			cache_ttl_split(u.cache_details.as_deref());
 		Self {
 			input_tokens: u.input_tokens as u64,
 			total_tokens: u.total_tokens as u64,
+			cache_creation_5m_input_tokens,
+			cache_creation_1h_input_tokens,
 			..Default::default()
 		}
 	}
+}
+
+/// Per-TTL cache-write split from AWS `TokenUsage.cacheDetails` (sorted 1h
+/// before 5m; empty/absent = aggregate only). Unknown TTL classes are
+/// counted under NEITHER canonical class — the aggregate attribute still
+/// carries them, and the accounting consumer fails closed on ambiguous
+/// meters rather than approximating.
+pub(crate) fn cache_ttl_split(
+	details: Option<&[bedrock::CacheDetail]>,
+) -> (Option<u64>, Option<u64>) {
+	let mut five_m = None;
+	let mut one_h = None;
+	for detail in details.unwrap_or(&[]) {
+		match detail.ttl {
+			bedrock::CacheTtl::FiveMinutes => five_m = Some(detail.input_tokens as u64),
+			bedrock::CacheTtl::OneHour => one_h = Some(detail.input_tokens as u64),
+			bedrock::CacheTtl::Unknown => {},
+		}
+	}
+	(five_m, one_h)
 }
 
 pub mod from_rerank {
@@ -1191,7 +1215,7 @@ pub mod from_completions {
 	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<bedrock::ConverseResponse>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let provider_usage = resp.usage.map(super::super::ProviderUsage::from);
+		let provider_usage = resp.usage.clone().map(super::super::ProviderUsage::from);
 		let openai = translate_response_internal(resp, model, tool_name_map)?;
 		let passthrough = json::convert::<_, types::completions::Response>(&openai)
 			.map_err(AIError::ResponseParsing)?;
@@ -1428,6 +1452,8 @@ pub mod from_completions {
 				},
 				bedrock::ConverseStreamOutput::Metadata(metadata) => {
 					if let Some(usage) = metadata.usage {
+						let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+							super::cache_ttl_split(usage.cache_details.as_deref());
 						log.update(|r| {
 							r.response.output_tokens = Some(usage.output_tokens as u64);
 							r.response.input_tokens = Some(usage.input_tokens as u64);
@@ -1435,6 +1461,8 @@ pub mod from_completions {
 							r.response.cached_input_tokens = usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								usage.cache_write_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+							r.response.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 							if let Some(completion) = completion.take() {
 								r.response.completion = Some(vec![completion]);
 							}
@@ -2010,7 +2038,7 @@ pub mod from_messages {
 	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<bedrock::ConverseResponse>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let provider_usage = resp.usage.map(super::super::ProviderUsage::from);
+		let provider_usage = resp.usage.clone().map(super::super::ProviderUsage::from);
 		let openai = translate_response_internal(resp, model, tool_name_map)?;
 		let passthrough =
 			json::convert::<_, types::messages::Response>(&openai).map_err(AIError::ResponseParsing)?;
@@ -2250,7 +2278,9 @@ pub mod from_messages {
 				},
 				bedrock::ConverseStreamOutput::Metadata(meta) => {
 					if let Some(usage) = meta.usage {
-						pending_usage = Some(usage);
+						pending_usage = Some(usage.clone());
+						let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+							super::cache_ttl_split(usage.cache_details.as_deref());
 						log.update(|r| {
 							r.response.output_tokens = Some(usage.output_tokens as u64);
 							r.response.input_tokens = Some(usage.input_tokens as u64);
@@ -2258,6 +2288,8 @@ pub mod from_messages {
 							r.response.cached_input_tokens = usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								usage.cache_write_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+							r.response.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 							if let Some(c) = completion.take() {
 								r.response.completion = Some(vec![c]);
 							}
@@ -3143,7 +3175,7 @@ pub mod from_responses {
 	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<bedrock::ConverseResponse>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let provider_usage = resp.usage.map(super::super::ProviderUsage::from);
+		let provider_usage = resp.usage.clone().map(super::super::ProviderUsage::from);
 		let adapter = super::ConverseResponseAdapter::from_response(resp, model)?;
 		let mut typed = adapter.to_responses_typed(tool_name_map);
 		if let Some(namespaces) = namespaces {
@@ -3471,7 +3503,9 @@ pub mod from_responses {
 				},
 				bedrock::ConverseStreamOutput::Metadata(meta) => {
 					if let Some(usage) = meta.usage {
-						pending_usage = Some(usage);
+						pending_usage = Some(usage.clone());
+						let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+							super::cache_ttl_split(usage.cache_details.as_deref());
 						log.update(|r| {
 							r.response.output_tokens = Some(usage.output_tokens as u64);
 							r.response.input_tokens = Some(usage.input_tokens as u64);
@@ -3479,6 +3513,8 @@ pub mod from_responses {
 							r.response.cached_input_tokens = usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								usage.cache_write_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+							r.response.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 						});
 					}
 
@@ -4072,6 +4108,7 @@ impl ConverseResponseAdapter {
 
 		let usage = self
 			.usage
+			.clone()
 			.map(|token_usage| {
 				let input_tokens = token_usage.input_tokens
 					+ token_usage.cache_read_input_tokens.unwrap_or_default()
@@ -4237,7 +4274,7 @@ impl ConverseResponseAdapter {
 		};
 
 		// Build usage
-		let usage = self.usage.map(|u| {
+		let usage = self.usage.clone().map(|u| {
 			let input_tokens = u.input_tokens
 				+ u.cache_read_input_tokens.unwrap_or_default()
 				+ u.cache_write_input_tokens.unwrap_or_default();
@@ -4328,6 +4365,7 @@ impl ConverseResponseAdapter {
 
 		let usage = self
 			.usage
+			.clone()
 			.map(|u| messagest::Usage {
 				input_tokens: u.input_tokens,
 				output_tokens: u.output_tokens,

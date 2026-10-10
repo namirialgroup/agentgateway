@@ -394,6 +394,17 @@ pub struct LLMResponse {
 	pub reasoning_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cache_creation_input_tokens: Option<u64>,
+	/// Cache-write tokens with a 5-minute TTL class, when the provider
+	/// reported the per-class split (Bedrock `cacheDetails[ttl=5m]`, Anthropic
+	/// `usage.cache_creation.ephemeral_5m_input_tokens`). `None` = no split
+	/// reported — consumers must fail closed on ambiguous aggregates rather
+	/// than approximate the class.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_5m_input_tokens: Option<u64>,
+	/// Cache-write tokens with a 1-hour TTL class, when the provider reported
+	/// the per-class split.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_1h_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cached_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]

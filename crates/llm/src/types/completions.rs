@@ -210,6 +210,9 @@ impl ResponseType for Response {
 					.and_then(|d| d.cache_write_tokens)
 					.or(u.cache_creation_input_tokens)
 			}),
+			// OpenAI-style usage carries no TTL classes — no split reported.
+			cache_creation_5m_input_tokens: None,
+			cache_creation_1h_input_tokens: None,
 			service_tier: self.service_tier.as_deref().map(Into::into),
 			provider_model: Some(strng::new(&self.model)),
 			completion: if log_content.completion {

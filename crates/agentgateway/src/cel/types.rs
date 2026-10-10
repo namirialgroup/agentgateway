@@ -1518,6 +1518,14 @@ pub struct LLMContext {
 	#[dynamic(rename = "cacheCreationInputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cache_creation_input_tokens: Option<u64>,
+	/// Per-TTL cache-write split when the provider reported it (None = no
+	/// split — consumers fail closed rather than approximate).
+	#[dynamic(rename = "cacheCreation5mInputTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_5m_input_tokens: Option<u64>,
+	#[dynamic(rename = "cacheCreation1hInputTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_1h_input_tokens: Option<u64>,
 	/// The number of tokens in the output/completion.
 	#[dynamic(rename = "outputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1634,6 +1642,8 @@ impl LLMContext {
 			input_audio_tokens: resp.input_audio_tokens,
 			cached_input_tokens: resp.cached_input_tokens,
 			cache_creation_input_tokens: resp.cache_creation_input_tokens,
+			cache_creation_5m_input_tokens: resp.cache_creation_5m_input_tokens,
+			cache_creation_1h_input_tokens: resp.cache_creation_1h_input_tokens,
 			service_tier: resp.service_tier,
 			usage_complete: resp.usage_complete,
 			response_model: resp.provider_model,
@@ -1738,6 +1748,8 @@ impl From<llm::LLMRequest> for LLMContext {
 			output_audio_tokens: None,
 			total_tokens: None,
 			provider_total_tokens: None,
+			cache_creation_5m_input_tokens: None,
+			cache_creation_1h_input_tokens: None,
 			completion: None,
 			tool_calls: None,
 			reasoning_tokens: None,
@@ -2453,6 +2465,8 @@ pub fn full_example_executor() -> ExecutorSerde {
 			input_audio_tokens: Some(5),
 			cached_input_tokens: Some(20),
 			cache_creation_input_tokens: Some(10),
+			cache_creation_5m_input_tokens: Some(4),
+			cache_creation_1h_input_tokens: Some(6),
 			output_tokens: Some(50),
 			output_image_tokens: Some(30),
 			output_text_tokens: Some(20),

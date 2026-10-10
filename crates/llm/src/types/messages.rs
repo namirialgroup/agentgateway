@@ -162,6 +162,25 @@ pub struct Usage {
 	pub rest: serde_json::Value,
 }
 
+impl Usage {
+	/// Per-TTL cache-write split from the pass-through `usage.cache_creation`
+	/// object (Anthropic-native `ephemeral_5m_input_tokens` /
+	/// `ephemeral_1h_input_tokens`). Read from `rest` so the client-facing
+	/// wire format stays byte-identical — no re-parsed typed field, no key
+	/// reordering. `None` = the provider reported no split; consumers must
+	/// not guess the class from the aggregate.
+	pub fn cache_ttl_split(&self) -> (Option<u64>, Option<u64>) {
+		let cache_creation = self.rest.get("cache_creation");
+		let five_m = cache_creation
+			.and_then(|c| c.get("ephemeral_5m_input_tokens"))
+			.and_then(|v| v.as_u64());
+		let one_h = cache_creation
+			.and_then(|c| c.get("ephemeral_1h_input_tokens"))
+			.and_then(|v| v.as_u64());
+		(five_m, one_h)
+	}
+}
+
 pub fn get_messages_helper(
 	messages: &[RequestMessage],
 	system: &Option<TextBlock>,
@@ -589,6 +608,8 @@ impl ResponseType for Response {
 			count_tokens: None,
 			reasoning_tokens: None,
 			cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
+			cache_creation_5m_input_tokens: self.usage.cache_ttl_split().0,
+			cache_creation_1h_input_tokens: self.usage.cache_ttl_split().1,
 			cached_input_tokens: self.usage.cache_read_input_tokens,
 			service_tier: self.usage.service_tier.as_deref().map(Into::into),
 			completion: if log_content.completion {
@@ -1365,6 +1386,9 @@ pub mod typed {
 				pages: None,
 				reasoning_tokens: None,
 				cache_creation_input_tokens: self.usage.cache_creation_input_tokens.map(|i| i as u64),
+				// Aggregate-only in this accumulated shape — no split reported.
+				cache_creation_5m_input_tokens: None,
+				cache_creation_1h_input_tokens: None,
 				cached_input_tokens: self.usage.cache_read_input_tokens.map(|i| i as u64),
 				service_tier: self.usage.service_tier.as_deref().map(Into::into),
 				provider_model: Some(agent_core::strng::new(&self.model)),
