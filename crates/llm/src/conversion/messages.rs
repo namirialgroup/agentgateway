@@ -801,10 +801,22 @@ pub mod from_completions {
 								message.usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								message.usage.cache_creation_input_tokens.map(|i| i as u64);
-							// TTL split stays unread here — message_start usage
-							// is provisional pre-turn state; only the terminal
-							// message_delta is cumulative-final (see the
-							// passthrough MessageStart arm).
+							// Input-side usage (cache write split included) is final at
+							// `message_start`; a reported all-zero split with a
+							// small aggregate is the provider's authoritative
+							// sub-minimum no-op write evidence.
+							r.response.cache_creation_5m_input_tokens = message
+								.usage
+								.cache_creation
+								.as_ref()
+								.and_then(|c| c.ephemeral_5m_input_tokens)
+								.map(|i| i as u64);
+							r.response.cache_creation_1h_input_tokens = message
+								.usage
+								.cache_creation
+								.as_ref()
+								.and_then(|c| c.ephemeral_1h_input_tokens)
+								.map(|i| i as u64);
 							// Provisional evidence: the cumulative totals only
 							// arrive on the terminal `message_delta`.
 							r.response.usage_complete = Some(false);
@@ -946,11 +958,19 @@ pub mod from_completions {
 						if let Some(cwt) = usage.cache_creation_input_tokens {
 							r.response.cache_creation_input_tokens = Some(cwt as u64);
 						}
-						if let Some(split) = &usage.cache_creation {
-							r.response.cache_creation_5m_input_tokens =
-								split.ephemeral_5m_input_tokens.map(|i| i as u64);
-							r.response.cache_creation_1h_input_tokens =
-								split.ephemeral_1h_input_tokens.map(|i| i as u64);
+						// The cumulative delta wins when it carries the split;
+						// absent leaves earlier evidence untouched.
+						if usage.cache_creation.is_some() {
+							r.response.cache_creation_5m_input_tokens = usage
+								.cache_creation
+								.as_ref()
+								.and_then(|c| c.ephemeral_5m_input_tokens)
+								.map(|i| i as u64);
+							r.response.cache_creation_1h_input_tokens = usage
+								.cache_creation
+								.as_ref()
+								.and_then(|c| c.ephemeral_1h_input_tokens)
+								.map(|i| i as u64);
 						}
 						if let Some(o) = usage.output_tokens {
 							r.response.output_tokens = Some(o as u64);
@@ -1195,13 +1215,26 @@ pub fn passthrough_stream(
 							message.usage.cache_read_input_tokens.map(|i| i as u64);
 						r.response.cache_creation_input_tokens =
 							message.usage.cache_creation_input_tokens.map(|i| i as u64);
-						// NOTE: the TTL split is deliberately NOT read here.
-						// `message_start` usage is provisional pre-turn state —
-						// captured production evidence shows it reporting
-						// `cache_creation: {5m: 0, 1h: 0}` alongside a positive
-						// aggregate — while the terminal `message_delta` usage
-						// is cumulative-final. Only the delta may carry the
-						// split into evidence.
+						// Input-side usage (cache write split included) is
+						// final at `message_start`; the terminal
+						// `message_delta` is cumulative-final. Only
+						// self-consistent splits become evidence.
+						// Input-side usage (cache write split included) is final at
+						// `message_start`; a reported all-zero split with a small
+						// aggregate is the provider's authoritative sub-minimum
+						// no-op write evidence.
+						r.response.cache_creation_5m_input_tokens = message
+							.usage
+							.cache_creation
+							.as_ref()
+							.and_then(|c| c.ephemeral_5m_input_tokens)
+							.map(|i| i as u64);
+						r.response.cache_creation_1h_input_tokens = message
+							.usage
+							.cache_creation
+							.as_ref()
+							.and_then(|c| c.ephemeral_1h_input_tokens)
+							.map(|i| i as u64);
 						// Provisional evidence: the cumulative totals only
 						// arrive on the terminal `message_delta`.
 						r.response.usage_complete = Some(false);
@@ -1265,11 +1298,19 @@ pub fn passthrough_stream(
 					if let Some(cwt) = usage.cache_creation_input_tokens {
 						r.response.cache_creation_input_tokens = Some(cwt as u64);
 					}
-					if let Some(split) = &usage.cache_creation {
-						r.response.cache_creation_5m_input_tokens =
-							split.ephemeral_5m_input_tokens.map(|i| i as u64);
-						r.response.cache_creation_1h_input_tokens =
-							split.ephemeral_1h_input_tokens.map(|i| i as u64);
+					// The cumulative delta wins when it carries the split;
+					// absent leaves earlier evidence untouched.
+					if usage.cache_creation.is_some() {
+						r.response.cache_creation_5m_input_tokens = usage
+							.cache_creation
+							.as_ref()
+							.and_then(|c| c.ephemeral_5m_input_tokens)
+							.map(|i| i as u64);
+						r.response.cache_creation_1h_input_tokens = usage
+							.cache_creation
+							.as_ref()
+							.and_then(|c| c.ephemeral_1h_input_tokens)
+							.map(|i| i as u64);
 					}
 					if let Some(o) = usage.output_tokens {
 						r.response.output_tokens = Some(o as u64);
