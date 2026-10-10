@@ -155,6 +155,53 @@ async fn passthrough_stream_message_delta_without_usage_leaves_no_zero_fabricati
 	);
 }
 
+/// The terminal `message_delta` usage may carry the Anthropic
+/// `usage.cache_creation` split object. The telemetry evidence must carry
+/// the per-TTL classes exactly as reported — including an explicit
+/// `Some(0)` bucket, which is real split evidence, not absence — and the
+/// client-facing passthrough wire stays byte-identical (json_passthrough).
+#[tokio::test]
+async fn passthrough_stream_message_delta_carries_ttl_split() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":67769,"output_tokens":44,"cache_creation_input_tokens":67759,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":67759,"ephemeral_1h_input_tokens":0}}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
+	assert_eq!(
+		info.response.cache_creation_5m_input_tokens,
+		Some(67759),
+		"5m bucket is explicit split evidence"
+	);
+	assert_eq!(
+		info.response.cache_creation_1h_input_tokens,
+		Some(0),
+		"a reported 1h zero is evidence of absence, not unknown"
+	);
+	assert_eq!(info.response.usage_complete, Some(true));
+}
+
+/// Aggregate-only streams (older providers, `cache_creation` absent) must
+/// keep the split unknown — never zero-fabricated — so downstream
+/// accounting keeps failing closed on ambiguous aggregates.
+#[tokio::test]
+async fn passthrough_stream_aggregate_only_keeps_ttl_split_unknown() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":91,"output_tokens":16,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, None);
+	assert_eq!(info.response.cache_creation_1h_input_tokens, None);
+}
+
 fn message_start_with_usage(usage_json: &str) -> String {
 	format!(
 		r#"data: {{"type":"message_start","message":{{"id":"msg_c","type":"message","role":"assistant","model":"accounts/fireworks/models/kimi-k3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{usage_json}}}}}"#,
