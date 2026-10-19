@@ -1745,6 +1745,7 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Completions,
+				false,
 				req,
 				parts,
 				managed_body,
@@ -1769,12 +1770,14 @@ impl AIProvider {
 			.read_body_and_default_model::<types::messages::Request>(policies, req, log)
 			.await?;
 		self.apply_model_alias(policies, &mut req);
+		let native_tool_search = req.uses_native_tool_search();
 
 		self
 			.process_chat_request(
 				backend_info,
 				policies,
 				InputFormat::Messages,
+				native_tool_search,
 				req,
 				parts,
 				managed_body,
@@ -1817,6 +1820,7 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Gemini,
+				false,
 				req,
 				parts,
 				managed_body,
@@ -1909,6 +1913,7 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Responses,
+				false,
 				req,
 				parts,
 				managed_body,
@@ -2259,6 +2264,7 @@ impl AIProvider {
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
 		original_format: InputFormat,
+		native_tool_search: bool,
 		mut req: T,
 		mut parts: Parts,
 		mut managed_body: Body,
@@ -2276,6 +2282,18 @@ impl AIProvider {
 			.as_deref()
 			.ok_or_else(|| AIError::MissingField("model not specified".into()))?;
 		let chat_translation = self.chat_translation(original_format, request_model, catalog)?;
+		// Native Anthropic Tool Search (deferred tool loading) cannot survive a
+		// chat format conversion: the Bedrock Converse/OpenAI/Gemini conversions
+		// drop the tool_search server tool and flatten tool_reference blocks,
+		// silently turning a deferred-tool request into a plain text one. Fail
+		// closed before render, on EVERY attempt — initial selection and failover
+		// both re-enter here, so a later switch to an incompatible upstream is
+		// rejected the same way, never silently degraded.
+		if native_tool_search && chat_translation.output != ChatFormat::AnthropicMessages {
+			return Ok(RequestResult::Rejected(anthropic_toolsearch_incompatible(
+				chat_translation.output.tag(),
+			)));
+		}
 		let provider_format = chat_translation.provider_format();
 		let prepared = self
 			.prepare_request(
@@ -3376,6 +3394,30 @@ fn google_invalid_argument(message: &str) -> ::http::Response<Body> {
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(body.to_string()))
 		.expect("failed to build gemini error response")
+}
+
+/// Terminal 400 in the Anthropic error shape for a `/v1/messages` request carrying
+/// native Tool Search (deferred tool loading) semantics that the selected upstream
+/// chat format cannot represent: converting would silently drop the `tool_search`
+/// server tool and flatten `tool_reference` blocks, degrading the request instead
+/// of executing it. Like the Gemini `alt=sse` guard, this answers directly rather
+/// than as an `AIError`, which would surface as a retryable 503 and invite SDK
+/// retry storms.
+fn anthropic_toolsearch_incompatible(upstream: &str) -> ::http::Response<Body> {
+	let body = serde_json::json!({
+		"type": "error",
+		"error": {
+			"type": "invalid_request_error",
+			"message": format!(
+				"This request uses Anthropic Tool Search (deferred tool loading), whose tool_reference semantics cannot be translated to the selected upstream format '{upstream}'. Route it to an Anthropic Messages-compatible provider; refusing rather than silently degrading the request."
+			),
+		}
+	});
+	::http::Response::builder()
+		.status(::http::StatusCode::BAD_REQUEST)
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(body.to_string()))
+		.expect("failed to build anthropic error response")
 }
 
 /// Remove `alt` from the request query, keeping any other parameters (e.g. `key`).

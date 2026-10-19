@@ -29,6 +29,70 @@ pub struct Request {
 	pub rest: serde_json::Value,
 }
 
+impl Request {
+	/// Whether this request carries native Anthropic Tool Search (deferred tool
+	/// loading) semantics: a `tool_search*` server tool offered in `tools`, or a
+	/// `tool_reference` content block in the conversation — either an assistant
+	/// turn requesting a deferred tool's schema, or a `tool_result` embedding the
+	/// schema reply. These semantics cannot survive a chat format conversion (the
+	/// Bedrock Converse/OpenAI/Gemini conversions drop the server tool and
+	/// flatten `tool_reference` blocks into plain text), so callers must keep
+	/// such requests on an Anthropic Messages-compatible upstream rather than
+	/// silently degrading them. Detection runs on the passthrough shape, which
+	/// preserves unknown blocks verbatim.
+	pub fn uses_native_tool_search(&self) -> bool {
+		tools_offer_native_tool_search(self.rest.get("tools"))
+			|| self.messages.iter().any(|m| {
+				m.content
+					.as_ref()
+					.is_some_and(content_references_deferred_tool)
+			})
+	}
+}
+
+/// A `tools` array (raw JSON from the passthrough `rest` field) offering any
+/// member of the `tool_search*` server-tool family — e.g.
+/// `tool_search_tool_regex_20250922` or `tool_search_tool_bm25_20251119`.
+/// The tool's `name` is optional upstream and irrelevant to detection.
+fn tools_offer_native_tool_search(tools: Option<&serde_json::Value>) -> bool {
+	tools.and_then(|t| t.as_array()).is_some_and(|items| {
+		items.iter().any(|tool| {
+			tool
+				.get("type")
+				.and_then(serde_json::Value::as_str)
+				.is_some_and(|tool_type| tool_type.starts_with("tool_search"))
+		})
+	})
+}
+
+/// A message content block referencing a deferred tool: a top-level
+/// `tool_reference` part (assistant turn), or a `tool_result` whose content
+/// array carries the deferred tool's schema reply as a `tool_reference` part.
+fn content_references_deferred_tool(block: &ContentBlock) -> bool {
+	let ContentBlock::Array(parts) = block else {
+		return false;
+	};
+	parts.iter().any(part_references_deferred_tool)
+}
+
+fn part_references_deferred_tool(part: &ContentPart) -> bool {
+	let ContentPart::Unknown(value) = part else {
+		return false;
+	};
+	match value.get("type").and_then(serde_json::Value::as_str) {
+		Some("tool_reference") => true,
+		Some("tool_result") => value
+			.get("content")
+			.and_then(serde_json::Value::as_array)
+			.is_some_and(|content| {
+				content.iter().any(|part| {
+					part.get("type").and_then(serde_json::Value::as_str) == Some("tool_reference")
+				})
+			}),
+		_ => false,
+	}
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize, Default)]
 pub struct RequestMessage {
 	pub role: String,
@@ -1676,5 +1740,96 @@ mod tests {
 			tool_calls[0].arguments,
 			serde_json::json!({"location":"San Francisco"})
 		);
+	}
+
+	fn parse_request(body: serde_json::Value) -> Request {
+		serde_json::from_value(body).expect("request must parse")
+	}
+
+	fn toolsearch_body_base() -> serde_json::Value {
+		serde_json::json!({
+			"model": "claude-sonnet-4-5",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "find a tool for that"}],
+		})
+	}
+
+	#[test]
+	fn native_tool_search_detected_from_regex_search_tool() {
+		let mut body = toolsearch_body_base();
+		body["tools"] = serde_json::json!([
+			{"type": "tool_search_tool_regex_20250922", "name": "tool_search"}
+		]);
+		assert!(parse_request(body).uses_native_tool_search());
+	}
+
+	#[test]
+	fn native_tool_search_detected_from_unnamed_search_tool() {
+		// The tool_search server tool's `name` is optional upstream.
+		let mut body = toolsearch_body_base();
+		body["tools"] = serde_json::json!([{"type": "tool_search_tool_regex_20250922"}]);
+		assert!(parse_request(body).uses_native_tool_search());
+	}
+
+	#[test]
+	fn native_tool_search_detected_from_bm25_variant() {
+		let mut body = toolsearch_body_base();
+		body["tools"] = serde_json::json!([
+			{"type": "tool_search_tool_bm25_20251119", "name": "tool_search"}
+		]);
+		assert!(parse_request(body).uses_native_tool_search());
+	}
+
+	#[test]
+	fn native_tool_search_detected_from_tool_reference_in_assistant_turn() {
+		let body = serde_json::json!({
+			"model": "claude-sonnet-4-5",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "list the widgets"},
+				{"role": "assistant", "content": [
+					{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+				]}
+			]
+		});
+		assert!(parse_request(body).uses_native_tool_search());
+	}
+
+	#[test]
+	fn native_tool_search_detected_from_schema_reply_in_tool_result() {
+		let body = serde_json::json!({
+			"model": "claude-sonnet-4-5",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "assistant", "content": [
+					{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+						{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+					]}
+				]}
+			]
+		});
+		assert!(parse_request(body).uses_native_tool_search());
+	}
+
+	#[test]
+	fn ordinary_tools_do_not_trigger_native_tool_search() {
+		let mut body = toolsearch_body_base();
+		body["tools"] = serde_json::json!([
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+			},
+			{"type": "web_search_20250305", "name": "web_search"}
+		]);
+		assert!(!parse_request(body).uses_native_tool_search());
+	}
+
+	#[test]
+	fn text_only_conversation_has_no_native_tool_search() {
+		assert!(!parse_request(toolsearch_body_base()).uses_native_tool_search());
 	}
 }
