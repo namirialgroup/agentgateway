@@ -50,7 +50,9 @@ use crate::telemetry::log;
 use crate::telemetry::log::{
 	AsyncLog, DropOnLog, RequestLog, SpanWriteOnDrop, SpanWriter, TraceSampler,
 };
-use crate::telemetry::metrics::{OutboundCallKind, OutboundCallLabels, OutboundCallSubtype};
+use crate::telemetry::metrics::{
+	OutboundCallKind, OutboundCallLabels, OutboundCallSubtype, UpstreamAttemptLabels,
+};
 use crate::telemetry::trc::TraceParent;
 use crate::transport::stream::{Extension, Socket, TCPConnectionInfo, TLSConnectionInfo};
 use crate::types::local::InternalBackend;
@@ -1185,22 +1187,25 @@ impl HTTPProxy {
 			.timeout
 			.as_ref()
 			.and_then(|t| t.request_timeout);
+		// On routes whose `buffer.request` policy buffered the body in full, the whole body is
+		// replayed from the same reference-counted bytes, so retrying it costs no extra memory.
+		// Without that opt-in the replay cap stays at 64 KiB, which large LLM prompts exceed.
+		let replay_limit = retry_replay_limit(&head.extensions, &body, MAX_BUFFERED_BYTES);
 		let mut replay_state = None;
-		let body =
-			if attempts > 1 && http_body::Body::size_hint(&body).lower() <= MAX_BUFFERED_BYTES as u64 {
-				// If we are going to attempt a retry we will need to track the incoming bytes for replay
-				let (content, state) = body.into_replay_parts();
-				replay_state = Some(state);
-				Ok(
-					http::retry::ReplayBody::try_new(content, MAX_BUFFERED_BYTES)
-						.expect("body size was checked before separating replay state"),
-				)
-			} else {
-				if attempts > 1 {
-					debug!("initial body is too large to retry, disabling retries");
-				}
-				Err(body)
-			};
+		let body = if attempts > 1 && http_body::Body::size_hint(&body).lower() <= replay_limit as u64 {
+			// If we are going to attempt a retry we will need to track the incoming bytes for replay
+			let (content, state) = body.into_replay_parts();
+			replay_state = Some(state);
+			Ok(
+				http::retry::ReplayBody::try_new(content, replay_limit)
+					.expect("body size was checked before separating replay state"),
+			)
+		} else {
+			if attempts > 1 {
+				debug!("initial body is too large to retry, disabling retries");
+			}
+			Err(body)
+		};
 		let mut substrate_state = None;
 		let mut next = match body {
 			Ok(retry) => Some(retry),
@@ -1221,6 +1226,7 @@ impl HTTPProxy {
 						&mut substrate_state,
 					)
 					.await;
+				record_upstream_attempt(log, &response, false);
 				// The body cannot be retried, but future requests must not reuse this assignment.
 				let stale_assignment = is_stale_assignment(&response);
 				if stale_assignment && let Some(state) = substrate_state.as_mut() {
@@ -1263,6 +1269,9 @@ impl HTTPProxy {
 				.expect("retry state is initialized")
 				.wrap(http::RawBody::new(this));
 			let req = Request::from_parts(head, body);
+			// Clear the previous attempt's endpoint so an attempt that fails before dialing is not
+			// attributed to the provider used by the previous attempt.
+			let previous_endpoint = if n > 0 { log.endpoint.take() } else { None };
 			let mut res = self
 				.attempt_upstream(
 					log,
@@ -1291,6 +1300,10 @@ impl HTTPProxy {
 						log.request_snapshot.as_deref(),
 					)
 				};
+			record_upstream_attempt(log, &res, retryable);
+			if log.endpoint.is_none() {
+				log.endpoint = previous_endpoint;
+			}
 			if !retryable {
 				if !last {
 					debug!("response not retry-able");
@@ -3149,6 +3162,8 @@ async fn make_backend_call(
 				None => method.clone(),
 			});
 			span.add_attribute(KeyValue::new("http.method", method));
+			// The dialed `host:port`, so each attempt of a retried request names its provider.
+			span.add_attribute(KeyValue::new("endpoint", call.target.to_string()));
 			if let Some(host) = call.req.uri().host() {
 				span.add_attribute(KeyValue::new("http.host", host.to_owned()));
 			}
@@ -3804,7 +3819,24 @@ fn finalize_attempt_for_retry(
 			http::outlierdetection::retry_after(resp.status(), resp.headers()),
 			log.cel.cel_context.maybe_snapshot_response(resp),
 		),
-		Err(SnapshottedProxyResponse(_)) => (None, None, None),
+		// A retryable transport failure on a final attempt becomes a generated 503/504 response that
+		// health conditions such as `response.code >= 500` evaluate. Give an intermediate attempt
+		// the same status so it can evict the provider before the retry selects one again.
+		Err(SnapshottedProxyResponse(ProxyResponse::Error(e))) => match retryable_error_status(e) {
+			Some(status) => {
+				let mut resp = ::http::Response::builder()
+					.status(status)
+					.body(http::Body::empty())
+					.expect("status-only response is valid");
+				(
+					Some(status),
+					None,
+					log.cel.cel_context.maybe_snapshot_response(&mut resp),
+				)
+			},
+			None => (None, None, None),
+		},
+		Err(SnapshottedProxyResponse(ProxyResponse::DirectResponse(_))) => (None, None, None),
 	};
 	let end_time = agent_core::Timestamp::now();
 	// This is an intermediate retry snapshot, so a best-effort clone is fine here.
@@ -3824,6 +3856,86 @@ fn finalize_attempt_for_retry(
 		llm_response.as_ref(),
 		mcp.as_ref(),
 	);
+}
+
+/// Record the outcome of one upstream attempt in metrics and, when it is retried, in the
+/// request log so the final span shows which provider failed and why.
+fn record_upstream_attempt(
+	log: &mut RequestLog,
+	res: &Result<Response, SnapshottedProxyResponse>,
+	retried: bool,
+) {
+	// No endpoint means the attempt never selected an upstream (e.g. it was rejected locally).
+	let Some(endpoint) = log.endpoint.as_ref().map(ToString::to_string) else {
+		return;
+	};
+	let outcome = match res {
+		Ok(resp) => resp.status().as_str().to_string(),
+		Err(SnapshottedProxyResponse(ProxyResponse::Error(e))) => upstream_error_class(e).to_string(),
+		Err(SnapshottedProxyResponse(ProxyResponse::DirectResponse(_))) => {
+			"direct_response".to_string()
+		},
+	};
+	if retried {
+		log.retry_reasons.push(format!("{endpoint}={outcome}"));
+	}
+	// Only LLM provider endpoints are bounded by configuration; service and dynamic backends
+	// would put pod IPs or client-chosen hosts into the label.
+	if log.llm_request.is_none() {
+		return;
+	}
+	log
+		.metrics
+		.upstream_attempts
+		.get_or_create(&UpstreamAttemptLabels {
+			backend: log
+				.backend_info
+				.as_ref()
+				.map(|info| info.backend_name.clone())
+				.into(),
+			endpoint: Some(agent_core::strng::new(&endpoint)).into(),
+			outcome: Some(agent_core::strng::new(&outcome)).into(),
+			retried,
+		})
+		.inc();
+}
+
+/// Status the proxy would return for a retryable upstream failure (see `into_response_with_grpc`).
+fn retryable_error_status(e: &ProxyError) -> Option<StatusCode> {
+	match e {
+		ProxyError::UpstreamCallFailed(_) | ProxyError::DnsResolution => {
+			Some(StatusCode::SERVICE_UNAVAILABLE)
+		},
+		ProxyError::UpstreamCallTimeout => Some(StatusCode::GATEWAY_TIMEOUT),
+		_ => None,
+	}
+}
+
+fn upstream_error_class(e: &ProxyError) -> &'static str {
+	match e {
+		ProxyError::UpstreamCallTimeout => "upstream_timeout",
+		ProxyError::RequestTimeout => "request_timeout",
+		ProxyError::UpstreamCallFailed(_) => "upstream_call_failed",
+		ProxyError::DnsResolution => "dns_resolution",
+		_ => "proxy_error",
+	}
+}
+
+/// Maximum number of request body bytes the retry loop may hold for replay.
+fn retry_replay_limit(
+	extensions: &::http::Extensions,
+	body: &http::Body,
+	default_limit: usize,
+) -> usize {
+	if extensions
+		.get::<crate::http::buffer::RequestBodyBuffered>()
+		.is_none()
+	{
+		return default_limit;
+	}
+	body
+		.known_bytes()
+		.map_or(default_limit, |bytes| bytes.len().max(default_limit))
 }
 
 fn should_retry(

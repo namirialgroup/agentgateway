@@ -25,6 +25,12 @@ pub struct BufferBody {
 	pub failure_mode: FailureMode,
 }
 
+/// Request extension set when a route `buffer.request` policy buffered the request body. The retry
+/// loop treats it as the route's opt-in to replay the whole buffered body instead of capping
+/// replays at 64 KiB.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestBodyBuffered;
+
 #[apply(schema!)]
 pub struct Buffer {
 	/// Buffer incoming request bodies before forwarding.
@@ -66,6 +72,7 @@ impl Buffer {
 				return Err(crate::proxy::ProxyResponse::DirectResponse(Box::new(resp)));
 			},
 		}
+		req.extensions_mut().insert(RequestBodyBuffered);
 		// Preserve an unset limit so LLM processing can apply its own default later.
 		if let Some(limit) = request.max_bytes {
 			req
