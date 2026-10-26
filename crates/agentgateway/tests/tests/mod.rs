@@ -11,6 +11,7 @@ mod direct_response;
 mod drain;
 mod hbone;
 mod llm;
+mod llm_failover;
 mod llm_providers;
 mod policy;
 mod smoke;

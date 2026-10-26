@@ -1155,6 +1155,7 @@ impl RequestLog {
 			retry_backoff: None,
 			jwt_sub: None,
 			retry_attempt: None,
+			retry_reasons: Vec::new(),
 			error: None,
 			grpc_status: Default::default(),
 			mcp_status: Default::default(),
@@ -1332,6 +1333,8 @@ pub struct RequestLog {
 	pub jwt_sub: Option<String>,
 
 	pub retry_attempt: Option<u8>,
+	/// One `endpoint=outcome` entry per upstream attempt that was retried, in attempt order.
+	pub retry_reasons: Vec<String>,
 	pub error: Option<String>,
 
 	pub grpc_status: AsyncLog<u8>,
@@ -1614,6 +1617,7 @@ impl Drop for DropOnLog {
 			}
 
 			let dur = format!("{}ms", duration.as_millis());
+			let retry_reasons = log.retry_reasons.join(",");
 			let route_duration = log
 				.ate_router_route_duration
 				.map(|duration| duration.as_secs_f64());
@@ -2024,6 +2028,10 @@ impl Drop for DropOnLog {
 					guardrails_json.as_ref().map(json_value_to_value_bag),
 				),
 				("retry.attempt", log.retry_attempt.display()),
+				(
+					"retry.reasons",
+					(!retry_reasons.is_empty()).then(|| retry_reasons.as_str().into()),
+				),
 				("error", log.error.quoted()),
 				("reason", reason.display()),
 				("duration", Some(dur.as_str().into())),
