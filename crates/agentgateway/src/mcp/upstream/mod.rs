@@ -14,7 +14,7 @@ pub use openapi::ParseError as OpenAPIParseError;
 use opentelemetry::KeyValue;
 use rmcp::model::{
 	ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, ExtensionCapabilities,
-	GetMeta, JsonObject, JsonRpcRequest,
+	GetMeta, JsonObject, JsonRpcRequest, ServerCapabilities,
 };
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::common::http_header::HEADER_SESSION_ID;
@@ -465,6 +465,15 @@ pub(crate) struct UpstreamGroup {
 	// target's initialize response so a modern client can see them in discover.
 	extensions: RwLock<HashMap<Strng, ExtensionCapabilities>>,
 
+	// per-target standard server capabilities (prompts/resources/tools) as
+	// declared in each target's initialize result. List fanouts consult this so
+	// a target that never declared `prompts` or `resources` is not asked for
+	// them: a tool-only server (SonarQube MCP, prod 2026-10-23) answers such a
+	// request with an HTTP 500 / -32603 exception body rather than a spec
+	// METHOD_NOT_FOUND, and under FailClosed that single target failed the whole
+	// aggregate for every client.
+	server_capabilities: RwLock<HashMap<Strng, ServerCapabilities>>,
+
 	// If we have one target and prefixMode is not Always, names and URIs pass
 	// through unchanged and all calls route to this target.
 	pub default_target_name: Option<String>,
@@ -514,6 +523,7 @@ impl UpstreamGroup {
 			client,
 			by_name: IndexMap::new(),
 			extensions: RwLock::new(HashMap::new()),
+			server_capabilities: RwLock::new(HashMap::new()),
 			default_target_name,
 			is_multiplexing,
 			all_targets_conditioned_out,
@@ -598,6 +608,19 @@ impl UpstreamGroup {
 		}
 		let mut store = self.extensions.write().expect("write lock");
 		store.insert(strng::new(target), ext.clone());
+	}
+
+	/// Remember which standard capabilities `target` declared at initialize.
+	pub(crate) fn record_server_capabilities(&self, target: &str, caps: &ServerCapabilities) {
+		let mut store = self.server_capabilities.write().expect("write lock");
+		store.insert(strng::new(target), caps.clone());
+	}
+
+	/// Targets a `<kind>/list` fanout should be sent to, given what each target
+	/// declared at initialize. See [`select_targets_supporting`].
+	pub(crate) fn targets_supporting(&self, kind: ListCapability) -> CapabilityTargets {
+		let store = self.server_capabilities.read().expect("read lock");
+		select_targets_supporting(self.by_name.keys().map(|k| k.as_str()), &store, kind)
 	}
 
 	/// merged view of all target's per-extension capabilities, combining the
@@ -720,6 +743,77 @@ impl UpstreamGroup {
 	}
 }
 
+/// Standard list capabilities a federated `*/list` fanout can be scoped by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListCapability {
+	Prompts,
+	/// `resources/list` and `resources/templates/list` both need `resources`.
+	Resources,
+}
+
+impl ListCapability {
+	/// Capability a client list request depends on; `None` for `tools/list`,
+	/// which stays an unfiltered fanout (every MCP server serves tools and a
+	/// failing tools/list must keep failing closed).
+	pub(crate) fn for_request(request: &ClientRequest) -> Option<Self> {
+		match request {
+			ClientRequest::ListPromptsRequest(_) => Some(Self::Prompts),
+			ClientRequest::ListResourcesRequest(_) | ClientRequest::ListResourceTemplatesRequest(_) => {
+				Some(Self::Resources)
+			},
+			_ => None,
+		}
+	}
+
+	fn declared_by(self, caps: &ServerCapabilities) -> bool {
+		match self {
+			Self::Prompts => caps.prompts.is_some(),
+			Self::Resources => caps.resources.is_some(),
+		}
+	}
+}
+
+/// Outcome of scoping a list fanout by declared capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapabilityTargets {
+	/// No target has recorded capabilities yet (stateless mode, or initialize
+	/// not seen by this group): fan out to every target exactly as before.
+	Unknown,
+	/// Fan out only to these targets. Empty means no target declared the
+	/// capability: the spec-correct answer is an empty list, without asking
+	/// anyone (asking a tool-only server is what produced the 500s).
+	Only(Vec<String>),
+}
+
+/// Decide which targets receive a `<kind>/list` request.
+///
+/// A target with no recorded capabilities is INCLUDED (unknown is treated as
+/// capable, so nothing a target could legitimately serve is ever hidden and
+/// failure semantics for it are unchanged); a target is EXCLUDED only when its
+/// initialize result is known and does not declare the capability. Security
+/// posture is untouched: this never adds a target, never changes FailureMode,
+/// and a declared-capable target that errors (auth, transport, internal) still
+/// fails the aggregate exactly as before.
+pub(crate) fn select_targets_supporting<'a>(
+	targets: impl Iterator<Item = &'a str>,
+	recorded: &HashMap<Strng, ServerCapabilities>,
+	kind: ListCapability,
+) -> CapabilityTargets {
+	if recorded.is_empty() {
+		return CapabilityTargets::Unknown;
+	}
+	CapabilityTargets::Only(
+		targets
+			.filter(|name| {
+				recorded
+					.get(*name)
+					.is_none_or(|caps| kind.declared_by(caps))
+			})
+			.map(str::to_string)
+			.collect(),
+	)
+}
+
 /// Extension names are unioned across all targets, but we only keep settings when all targets agree
 /// on the same settings object. If any target has a different settings object for the same
 /// extension, we log a warning and advertise the extension with empty settings.
@@ -755,6 +849,114 @@ mod tests {
 		let mut e = ExtensionCapabilities::new();
 		e.insert(id.to_string(), settings.as_object().cloned().unwrap());
 		e
+	}
+
+	// --- capability-aware list fanout (prod federated-mcp 500s, 2026-10-23) ---
+
+	/// Mixed-capability federation as deployed: MongoDB and internal-tools declare
+	/// tools+prompts+resources, SonarQube MCP (tool-only) declares tools only.
+	fn federation() -> HashMap<Strng, ServerCapabilities> {
+		let full = ServerCapabilities::builder()
+			.enable_tools()
+			.enable_prompts()
+			.enable_resources()
+			.build();
+		let tools_only = ServerCapabilities::builder().enable_tools().build();
+		HashMap::from([
+			(strng::new("mongodb-mcp-target"), full.clone()),
+			(strng::new("synapse-internal-tools-mcp-server-target"), full),
+			(strng::new("sonarqube-mcp-target"), tools_only),
+		])
+	}
+	const ALL: [&str; 3] = [
+		"synapse-internal-tools-mcp-server-target",
+		"mongodb-mcp-target",
+		"sonarqube-mcp-target",
+	];
+
+	#[test]
+	fn prompts_list_skips_the_tool_only_target_and_keeps_the_healthy_ones() {
+		let got = select_targets_supporting(ALL.into_iter(), &federation(), ListCapability::Prompts);
+		assert_eq!(
+			got,
+			CapabilityTargets::Only(vec![
+				"synapse-internal-tools-mcp-server-target".into(),
+				"mongodb-mcp-target".into(),
+			])
+		);
+	}
+
+	#[test]
+	fn resources_list_and_templates_use_the_resources_capability() {
+		let got = select_targets_supporting(ALL.into_iter(), &federation(), ListCapability::Resources);
+		assert_eq!(
+			got,
+			CapabilityTargets::Only(vec![
+				"synapse-internal-tools-mcp-server-target".into(),
+				"mongodb-mcp-target".into(),
+			])
+		);
+		let templates = ClientRequest::ListResourceTemplatesRequest(rmcp::model::ListResourceTemplatesRequest {
+			method: Default::default(),
+			params: None,
+			extensions: Default::default(),
+		});
+		assert_eq!(ListCapability::for_request(&templates), Some(ListCapability::Resources));
+	}
+
+	#[test]
+	fn tools_list_is_never_capability_filtered() {
+		let tools = ClientRequest::ListToolsRequest(rmcp::model::ListToolsRequest {
+			method: Default::default(),
+			params: None,
+			extensions: Default::default(),
+		});
+		assert_eq!(ListCapability::for_request(&tools), None);
+	}
+
+	#[test]
+	fn nothing_recorded_means_unchanged_fanout_to_everyone() {
+		// Stateless mode / initialize not seen by this group: behave exactly as before.
+		let got = select_targets_supporting(ALL.into_iter(), &HashMap::new(), ListCapability::Prompts);
+		assert_eq!(got, CapabilityTargets::Unknown);
+	}
+
+	#[test]
+	fn a_target_without_a_record_stays_included() {
+		// Unknown is treated as capable: nothing a target could legitimately serve is hidden,
+		// and its failure semantics (fail-closed on auth/transport errors) are unchanged.
+		let mut recorded = federation();
+		recorded.remove("mongodb-mcp-target");
+		let got = select_targets_supporting(ALL.into_iter(), &recorded, ListCapability::Prompts);
+		assert_eq!(
+			got,
+			CapabilityTargets::Only(vec![
+				"synapse-internal-tools-mcp-server-target".into(),
+				"mongodb-mcp-target".into(),
+			])
+		);
+	}
+
+	#[test]
+	fn all_tool_only_targets_yield_an_empty_list_not_a_fanout() {
+		let tools_only = ServerCapabilities::builder().enable_tools().build();
+		let recorded = HashMap::from([(strng::new("sonarqube-mcp-target"), tools_only)]);
+		let got = select_targets_supporting(
+			["sonarqube-mcp-target"].into_iter(),
+			&recorded,
+			ListCapability::Prompts,
+		);
+		assert_eq!(got, CapabilityTargets::Only(vec![]));
+	}
+
+	#[test]
+	fn selection_never_adds_targets_and_preserves_order() {
+		// Security property: the filtered set is always a subset of the configured targets.
+		let got = select_targets_supporting(ALL.into_iter(), &federation(), ListCapability::Prompts);
+		let CapabilityTargets::Only(names) = got else { panic!("expected a filtered set") };
+		assert!(names.iter().all(|n| ALL.contains(&n.as_str())));
+		assert_eq!(names.len(), 2);
+		assert_eq!(names[0], ALL[0]); // configured order kept
 	}
 
 	#[test]

@@ -832,6 +832,7 @@ impl Relay {
 					return Err(incompatible_upstream_result("initialize"));
 				};
 				upstreams.record_extensions(name.as_str(), ir.capabilities.extensions.as_ref());
+				upstreams.record_server_capabilities(name.as_str(), &ir.capabilities);
 				return Ok(ir.into());
 			}
 
@@ -845,6 +846,7 @@ impl Relay {
 					return Err(incompatible_upstream_result("initialize"));
 				};
 				upstreams.record_extensions(server_name.as_str(), r.capabilities.extensions.as_ref());
+				upstreams.record_server_capabilities(server_name.as_str(), &r.capabilities);
 				if r.protocol_version.to_string() < lowest_version.to_string() {
 					lowest_version = r.protocol_version;
 				}
@@ -1504,6 +1506,21 @@ impl Relay {
 			}
 			target_names = Some(upstream_cursors.keys().cloned().collect());
 		}
+		// Capability-aware fanout: a prompts/resources list goes only to targets
+		// that declared the capability at initialize. A cursor already scopes the
+		// targets (it was minted from a previous page), so it takes precedence.
+		let mut empty_by_capability = false;
+		if target_names.is_none()
+			&& let Some(kind) = upstream::ListCapability::for_request(&r.request)
+		{
+			match self.upstreams.targets_supporting(kind) {
+				upstream::CapabilityTargets::Unknown => {},
+				upstream::CapabilityTargets::Only(names) if names.is_empty() => {
+					empty_by_capability = true;
+				},
+				upstream::CapabilityTargets::Only(names) => target_names = Some(names),
+			}
+		}
 		let merge: Box<MergeFn> = Box::new(move |mut results, cel| {
 			let mut cursors = Vec::new();
 			for (name, result) in &mut results {
@@ -1529,6 +1546,22 @@ impl Relay {
 				cursor;
 			Ok(result)
 		});
+		if empty_by_capability {
+			// No target declared this capability: answer the spec-correct empty
+			// list without a fanout (fanout_open_streams treats an empty
+			// selection as "no upstreams available", which is not what this is).
+			let id = r.id.clone();
+			let cel = CelExecWrapper::from(ctx.clone());
+			let result = merge(Vec::new(), &cel)?;
+			return respond_with_guardrails(
+				id,
+				Messages::from_result(r.id.clone(), result),
+				None,
+				ctx.extensions().get::<AsyncLog<MCPInfo>>().cloned(),
+				&ctx,
+				self.upstreams.sse_keep_alive,
+			);
+		}
 		self
 			.send_fanout_to(r, ctx, merge, target_names, |name, r| {
 				let mut r = r.clone();
