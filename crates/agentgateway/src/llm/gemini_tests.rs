@@ -1003,8 +1003,14 @@ async fn count_tokens_errors_pass_through_unchanged() {
 		)
 		.expect("error response should process");
 	assert_eq!(resp.status(), ::http::StatusCode::NOT_FOUND);
-	// Only Google upstreams serve this route, so the client already speaks the error shape.
-	assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), body);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["error"]["code"], 404);
+	assert_eq!(error["error"]["status"], "not_found_error");
+	assert_eq!(
+		error["error"]["message"],
+		"The requested upstream resource is not available."
+	);
 }
 
 // ── unsupported upstreams ───────────────────────────────────────────────────

@@ -3156,7 +3156,7 @@ mod tests {
 				} else {
 					Ok(::http::Response::new(crate::http::Body::empty()))
 				};
-				let (mut response, mut reason) = resolve_response(initial, &mut log, false);
+				let (mut response, mut reason) = resolve_response(initial, &mut log, false, None);
 				let original_reason = reason;
 				let metadata = TransformationMetadata(serde_json::Map::from_iter([(
 					"marker".to_string(),
@@ -3169,6 +3169,7 @@ mod tests {
 							Err(ProxyError::ProcessingString("policy failed".to_string()).into()),
 							&mut log,
 							false,
+							None,
 						);
 						response.extensions_mut().insert(metadata.clone());
 					},
@@ -3182,6 +3183,7 @@ mod tests {
 							Err(ProxyResponse::DirectResponse(Box::new(replacement))),
 							&mut log,
 							false,
+							None,
 						);
 					},
 					_ => {},

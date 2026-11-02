@@ -37,6 +37,54 @@ async fn llm_openai() {
 }
 
 #[tokio::test]
+async fn llm_success_response_strips_internal_headers() {
+	let mock = MockServer::start().await;
+	Mock::given(wiremock::matchers::any())
+		.respond_with(
+			ResponseTemplate::new(200)
+				.insert_header("content-type", "application/json")
+				.insert_header("x-request-id", "public-correlation-id")
+				.insert_header("x-synapse-thinking-compat", "stripped-unsigned-thinking")
+				.insert_header("x-amzn-requestid", "private-provider-id")
+				.insert_header("x-envoy-upstream-service-time", "12")
+				.insert_header("x-provider-debug", "internal-config")
+				.insert_header("fireworks-prompt-tokens", "123")
+				.insert_header("traceresponse", "00-private-trace-id-01")
+				.set_body_raw(
+					include_bytes!("../../../llm/src/tests/response/completions/basic.json").to_vec(),
+					"application/json",
+				),
+		)
+		.mount(&mock)
+		.await;
+	let (_mock, _bind, io) = setup_llm_mock(
+		mock,
+		AIProvider::OpenAI(openai::Provider {
+			model_override: None,
+			moderation: None,
+		}),
+		false,
+		"{}",
+	);
+	let response = send_completions_with_model(io, "replaceme", &[]).await;
+	assert_eq!(response.status(), StatusCode::OK);
+	assert_eq!(response.headers()["x-request-id"], "public-correlation-id");
+	for name in [
+		"x-synapse-thinking-compat",
+		"x-amzn-requestid",
+		"x-envoy-upstream-service-time",
+		"x-provider-debug",
+		"fireworks-prompt-tokens",
+		"traceresponse",
+	] {
+		assert!(response.headers().get(name).is_none(), "{name} leaked");
+	}
+	let body = response.into_body().collect().await.unwrap().to_bytes();
+	let parsed: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(parsed["object"], "chat.completion");
+}
+
+#[tokio::test]
 async fn llm_openai_tokenize() {
 	let mock = body_mock(llm_body!("response/completions/basic.json")).await;
 	let (_mock, _bind, io) = setup_llm_mock(
@@ -296,6 +344,83 @@ async fn llm_detect_mode_respects_model_rewrite() {
 		"gen_ai.usage.output_tokens": 23
 	});
 	assert!(is_json_subset(&want, &log), "want={want:#?} got={log:#?}");
+}
+
+#[tokio::test]
+async fn llm_upstream_errors_are_sanitized_for_both_public_protocols() {
+	let mock = MockServer::start().await;
+	Mock::given(wiremock::matchers::any())
+		.respond_with(
+			ResponseTemplate::new(403)
+				.insert_header("content-type", "application/json")
+				.insert_header("x-request-id", "public-correlation-id")
+				.insert_header("x-amzn-errortype", "AccessDeniedException")
+				.insert_header("x-provider-debug", "internal-config")
+				.insert_header("retry-after", "3")
+				.set_body_json(json!({
+					"error": {
+						"type": "authentication_error",
+						"message": "User: arn:aws:sts::123456789012:assumed-role/prod-agentgateway-bedrock-irsa/session is not authorized to perform: bedrock:CountTokens on bedrock-runtime.eu-west-1.amazonaws.com"
+					}
+				})),
+		)
+		.mount(&mock)
+		.await;
+	let (_mock, _bind, io) = setup_custom_llm_provider_backend_mock(
+		mock,
+		vec![
+			custom::ProviderFormat::Messages,
+			custom::ProviderFormat::Completions,
+		],
+	);
+
+	for (path, request) in [
+		(
+			"/custom-ai/v1/messages",
+			json!({"model":"replaceme","max_tokens":1,"messages":[]}),
+		),
+		(
+			"/custom-ai/v1/chat/completions",
+			json!({"model":"replaceme","messages":[]}),
+		),
+	] {
+		let response = RequestBuilder::new(Method::POST, &format!("http://lo{path}"))
+			.header("content-type", "application/json")
+			.header("x-synapse-request-id", "synapse-public-correlation-id")
+			.body(Body::from(serde_json::to_vec(&request).unwrap()))
+			.send(io.clone())
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
+		assert_eq!(response.headers()["x-request-id"], "public-correlation-id");
+		assert_eq!(
+			response.headers()["x-synapse-request-id"],
+			"synapse-public-correlation-id"
+		);
+		assert_eq!(response.headers()["retry-after"], "3");
+		assert!(response.headers().get("x-amzn-errortype").is_none());
+		assert!(response.headers().get("x-provider-debug").is_none());
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		let text = String::from_utf8_lossy(&body);
+		for marker in [
+			"123456789012",
+			"assumed-role",
+			"prod-agentgateway-bedrock-irsa",
+			"bedrock:CountTokens",
+			"bedrock-runtime.eu-west-1.amazonaws.com",
+		] {
+			assert!(!text.contains(marker), "{path} leaked {marker}: {text}");
+		}
+		let error: Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(error["error"]["type"], "api_error");
+		assert_eq!(
+			error["error"]["message"],
+			"The gateway could not authenticate to the upstream provider."
+		);
+		if path.ends_with("/v1/messages") {
+			assert_eq!(error["type"], "error");
+		}
+	}
 }
 
 async fn setup_local_llm_config(yaml: &str) -> TestBind {
@@ -1344,12 +1469,13 @@ async fn llm_custom_provider_rejects_unsupported_format_before_upstream_call() {
 	let res = send_completions_with_model(io, "replaceme", &[]).await;
 	assert_eq!(res.status(), 400);
 	let body = read_body_raw(res.into_body()).await;
-	assert!(
-		String::from_utf8_lossy(&body)
-			.contains("unsupported conversion: from Completions to provider custom"),
-		"unexpected response body: {}",
-		String::from_utf8_lossy(&body)
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert_eq!(
+		error["error"]["message"],
+		"The request uses a feature unsupported by this endpoint."
 	);
+	assert!(!String::from_utf8_lossy(&body).contains("provider custom"));
 
 	let requests = mock
 		.received_requests()
