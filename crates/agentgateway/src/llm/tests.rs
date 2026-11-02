@@ -4560,7 +4560,14 @@ async fn builtin_web_search_to_bedrock_is_rejected_before_downgrade() {
 		"model": "anthropic.claude-sonnet-5-5",
 		"max_tokens": 16,
 		"messages": [{"role": "user", "content": "Search"}],
-		"tools": [{"type": "web_search_20250305", "name": "web_search"}]
+		"tools": [
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+			},
+			{"type": "web_search_20250305", "name": "web_search"}
+		]
 	});
 	let error = process_toolsearch_messages(&provider, body)
 		.await
@@ -4838,8 +4845,7 @@ async fn ordinary_tools_request_to_bedrock_converse_still_converts() {
 				"name": "get_weather",
 				"description": "Get the weather",
 				"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
-			},
-			{"type": "web_search_20250305", "name": "web_search"}
+			}
 		]
 	});
 	let result = process_toolsearch_messages(&provider, body).await.unwrap();
