@@ -2243,7 +2243,9 @@ fn test_messages_native_web_search_is_rejected_explicitly() {
 	let err = super::from_messages::translate(&req, &provider, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
-		err.to_string().contains("server-side tool 'web_search' is not supported"),
+		err
+			.to_string()
+			.contains("server-side tool 'web_search' is not supported"),
 		"unexpected error: {err}"
 	);
 }
