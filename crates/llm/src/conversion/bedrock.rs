@@ -1717,8 +1717,45 @@ pub mod from_messages {
 			result
 		});
 
+		fn document_from_anthropic(
+			source: &serde_json::Value,
+			title: Option<&str>,
+			used_doc_names: &mut HashSet<String>,
+		) -> Result<bedrock::DocumentBlock, AIError> {
+			let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+			if source_type != "base64" {
+				return Err(AIError::UnsupportedConversion(strng::format!(
+					"bedrock document source type '{source_type}' is unsupported; use base64"
+				)));
+			}
+			let media_type = source.get("media_type").and_then(|v| v.as_str());
+			let bytes = source
+				.get("data")
+				.and_then(|v| v.as_str())
+				.map(str::to_owned)
+				.ok_or_else(|| {
+					AIError::UnsupportedConversion(strng::literal!(
+						"bedrock base64 document source requires data"
+					))
+				})?;
+			let format = super::from_responses::derive_doc_format(media_type, title)?;
+			let base_name = super::from_responses::sanitize_doc_name(title);
+			let mut name = base_name.clone();
+			let mut suffix = 2;
+			while !used_doc_names.insert(name.clone()) {
+				name = format!("{base_name} [{suffix}]");
+				suffix += 1;
+			}
+			Ok(bedrock::DocumentBlock {
+				format: format.to_string(),
+				name,
+				source: bedrock::DocumentSource { bytes },
+			})
+		}
+
 		// Convert typed Anthropic messages to Bedrock messages
 		let mut messages = Vec::new();
+		let mut used_doc_names = std::collections::HashSet::new();
 		for msg in req.messages {
 			let role = match msg.role {
 				messages::Role::Assistant => bedrock::Role::Assistant,
@@ -1797,43 +1834,59 @@ pub mod from_messages {
 							},
 							messages::ToolResultContent::Array(parts) => parts
 								.into_iter()
-								.filter_map(|part| match part {
-									messages::ToolResultContentPart::Text {
-										text,
-										cache_control,
-										..
-									} => {
-										has_cache_control |= cache_control.is_some();
-										Some(bedrock::ToolResultContentBlock::Text(text))
-									},
-									messages::ToolResultContentPart::Image {
-										source,
-										cache_control,
-									} => {
-										if let Some(media_type) = source.get("media_type").and_then(|v| v.as_str())
-											&& let Some(data) = source.get("data").and_then(|v| v.as_str())
-											&& let Ok(image) =
-												super::CanonicalImage::from_media_type_and_base64(media_type, data)
-										{
+								.map(|part| {
+									let block = match part {
+										messages::ToolResultContentPart::Text {
+											text,
+											cache_control,
+											..
+										} => {
 											has_cache_control |= cache_control.is_some();
-											Some(bedrock::ToolResultContentBlock::Image(
-												image.into_bedrock_image_block(),
+											Some(bedrock::ToolResultContentBlock::Text(text))
+										},
+										messages::ToolResultContentPart::Image {
+											source,
+											cache_control,
+										} => {
+											if let Some(media_type) = source.get("media_type").and_then(|v| v.as_str())
+												&& let Some(data) = source.get("data").and_then(|v| v.as_str())
+												&& let Ok(image) =
+													super::CanonicalImage::from_media_type_and_base64(media_type, data)
+											{
+												has_cache_control |= cache_control.is_some();
+												Some(bedrock::ToolResultContentBlock::Image(
+													image.into_bedrock_image_block(),
+												))
+											} else {
+												None
+											}
+										},
+										messages::ToolResultContentPart::ToolReference {
+											tool_name,
+											cache_control,
+										} => {
+											has_cache_control |= cache_control.is_some();
+											Some(bedrock::ToolResultContentBlock::Text(tool_name))
+										},
+										messages::ToolResultContentPart::Document {
+											source,
+											cache_control,
+											title,
+											..
+										} => {
+											has_cache_control |= cache_control.is_some();
+											Some(bedrock::ToolResultContentBlock::Document(
+												document_from_anthropic(&source, title.as_deref(), &mut used_doc_names)?,
 											))
-										} else {
-											None
-										}
-									},
-									messages::ToolResultContentPart::ToolReference {
-										tool_name,
-										cache_control,
-									} => {
-										has_cache_control |= cache_control.is_some();
-										Some(bedrock::ToolResultContentBlock::Text(tool_name))
-									},
-									messages::ToolResultContentPart::Document { .. }
-									| messages::ToolResultContentPart::SearchResult { .. }
-									| messages::ToolResultContentPart::Unknown => None,
+										},
+										messages::ToolResultContentPart::SearchResult { .. }
+										| messages::ToolResultContentPart::Unknown => None,
+									};
+									Ok(block)
 								})
+								.collect::<Result<Vec<_>, AIError>>()?
+								.into_iter()
+								.flatten()
 								.collect(),
 						};
 
@@ -1870,7 +1923,19 @@ pub mod from_messages {
 						}),
 						false,
 					),
-					messages::ContentBlock::Document(_) => continue,
+					messages::ContentBlock::Document(messages::ContentDocumentBlock {
+						source,
+						cache_control,
+						title,
+						..
+					}) => (
+						bedrock::ContentBlock::Document(document_from_anthropic(
+							&source,
+							title.as_deref(),
+							&mut used_doc_names,
+						)?),
+						cache_control.is_some(),
+					),
 					messages::ContentBlock::SearchResult(_) => continue,
 					messages::ContentBlock::ServerToolUse { .. } => continue,
 					messages::ContentBlock::Unknown => continue,
@@ -2407,7 +2472,7 @@ pub mod from_responses {
 		}
 	}
 
-	fn derive_doc_format(
+	pub(crate) fn derive_doc_format(
 		media_type: Option<&str>,
 		filename: Option<&str>,
 	) -> Result<&'static str, AIError> {
@@ -2428,7 +2493,7 @@ pub mod from_responses {
 	// Bedrock document names may only contain alphanumerics, whitespace, hyphens,
 	// parentheses, and square brackets, with no consecutive whitespace. Notably this
 	// excludes periods, so "notes.txt" must be rewritten before sending.
-	fn sanitize_doc_name(filename: Option<&str>) -> String {
+	pub(crate) fn sanitize_doc_name(filename: Option<&str>) -> String {
 		let Some(name) = filename else {
 			return "document".to_string();
 		};
