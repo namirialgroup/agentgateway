@@ -55,7 +55,7 @@ pub fn strip_internal_response_headers(headers: &mut HeaderMap) {
 		.keys()
 		.filter(|name| {
 			let name = name.as_str();
-			(matches!(name, "server" | "fireworks-prompt-tokens" | "traceresponse")
+			(matches!(name, "server" | "trailer" | "fireworks-prompt-tokens" | "traceresponse")
 				|| name.starts_with("x-amzn-")
 				|| name.starts_with("x-aws-")
 				|| name.starts_with("x-envoy-")
@@ -353,6 +353,7 @@ mod tests {
 		] {
 			let mut headers = HeaderMap::new();
 			headers.insert("server", "internal-upstream-implementation".parse().unwrap());
+			headers.insert("trailer", "fireworks-prompt-tokens, traceresponse".parse().unwrap());
 			headers.insert("fireworks-prompt-tokens", "123".parse().unwrap());
 			headers.insert("traceresponse", "00-private-trace-id-01".parse().unwrap());
 			headers.insert("request-id", "anthropic-contract-id".parse().unwrap());
@@ -361,6 +362,7 @@ mod tests {
 			headers.insert("retry-after", "3".parse().unwrap());
 			sanitize(&mut headers);
 			assert!(headers.get("server").is_none());
+			assert!(headers.get("trailer").is_none());
 			assert!(headers.get("fireworks-prompt-tokens").is_none());
 			assert!(headers.get("traceresponse").is_none());
 			assert_eq!(headers["request-id"], "anthropic-contract-id");
