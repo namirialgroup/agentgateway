@@ -1798,11 +1798,15 @@ impl AIProvider {
 		// equivalent; anything it cannot translate keeps the strict guard
 		// below (defense in depth).
 		let mut native_tool_search = req.uses_native_tool_search();
-		// Models without verified native support also cannot serve Anthropic
-		// built-in server tools (web_search/web_fetch/code_execution):
-		// third-party providers reject those tool types outright (Fireworks
-		// 400, 2026-10-20). Downgrade those requests too — removal with
-		// telemetry beats relying on every client's retry-and-recover.
+		// Bedrock Converse cannot execute Anthropic built-in server tools
+		// (web_search/web_fetch/code_execution). Reject before the compatibility
+		// downgrade can hide the requested capability; other non-native providers
+		// keep their existing eager downgrade behavior.
+		if req.offers_builtin_server_tools() && matches!(self, AIProvider::Bedrock(_)) {
+			return Err(AIError::UnsupportedConversion(strng::literal!(
+				"anthropic built-in server tools are not supported by Bedrock Converse"
+			)));
+		}
 		//
 		// Mode resolution: env allowlist (deployment safety ceiling) ∩ the
 		// dynamic policy artifact when one is configured (background refresh,

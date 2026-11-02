@@ -4547,6 +4547,29 @@ async fn verified_model_toolsearch_on_bedrock_mantle_is_rejected() {
 }
 
 #[tokio::test]
+async fn builtin_web_search_to_bedrock_is_rejected_before_downgrade() {
+	let _env = ScopedToolSearchEnv::allow("a-different-model").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+	}));
+	let body = json!({
+		"model": "anthropic.claude-sonnet-5-5",
+		"max_tokens": 16,
+		"messages": [{"role": "user", "content": "Search"}],
+		"tools": [{"type": "web_search_20250305", "name": "web_search"}]
+	});
+	let error = process_toolsearch_messages(&provider, body)
+		.await
+		.unwrap_err();
+	assert!(matches!(error, AIError::UnsupportedConversion(_)));
+	assert!(error.to_string().contains("not supported by Bedrock Converse"));
+}
+
+#[tokio::test]
 async fn builtin_web_search_only_request_is_downgraded_for_unverified_model() {
 	// 2026-10-20 class C entry gate: a request carrying ONLY Anthropic
 	// built-in server tools (no Tool Search shapes at all) on an unverified
