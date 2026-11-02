@@ -1725,8 +1725,25 @@ pub mod from_messages {
 			result
 		});
 
+		for msg in &req.messages {
+			for block in &msg.content {
+				if let messages::ContentBlock::ToolResult {
+					content: messages::ToolResultContent::Array(parts),
+					..
+				} = block
+					&& parts.iter().any(|part| {
+						matches!(part, messages::ToolResultContentPart::Document { .. })
+					}) {
+					return Err(AIError::UnsupportedConversion(strng::literal!(
+						"bedrock tool-result document inputs are unsupported; move the document to a user message"
+					)));
+				}
+			}
+		}
+
 		// Convert typed Anthropic messages to Bedrock messages
 		let mut messages = Vec::new();
+		let mut used_doc_names = std::collections::HashSet::new();
 		for msg in req.messages {
 			let role = match msg.role {
 				messages::Role::Assistant => bedrock::Role::Assistant,
@@ -1878,7 +1895,44 @@ pub mod from_messages {
 						}),
 						false,
 					),
-					messages::ContentBlock::Document(_) => continue,
+					messages::ContentBlock::Document(messages::ContentDocumentBlock {
+						source,
+						cache_control,
+						title,
+						..
+					}) => {
+						let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+						if source_type != "base64" {
+							return Err(AIError::UnsupportedConversion(strng::format!(
+								"bedrock document source type '{source_type}' is unsupported; use base64"
+							)));
+						}
+						let media_type = source.get("media_type").and_then(|v| v.as_str());
+						let bytes = source
+							.get("data")
+							.and_then(|v| v.as_str())
+							.map(str::to_owned)
+							.ok_or_else(|| {
+								AIError::UnsupportedConversion(strng::literal!(
+									"bedrock base64 document source requires data"
+								))
+							})?;
+						let format = super::from_responses::derive_doc_format(media_type, title.as_deref())?;
+						let mut name = super::from_responses::sanitize_doc_name(title.as_deref());
+						let mut suffix = 2;
+						while !used_doc_names.insert(name.clone()) {
+							name = format!("{} [{}]", super::from_responses::sanitize_doc_name(title.as_deref()), suffix);
+							suffix += 1;
+						}
+						(
+							bedrock::ContentBlock::Document(bedrock::DocumentBlock {
+								format: format.to_string(),
+								name,
+								source: bedrock::DocumentSource { bytes },
+							}),
+							cache_control.is_some(),
+						)
+					},
 					messages::ContentBlock::SearchResult(_) => continue,
 					messages::ContentBlock::ServerToolUse { .. } => continue,
 					messages::ContentBlock::Unknown => continue,
@@ -2415,7 +2469,7 @@ pub mod from_responses {
 		}
 	}
 
-	fn derive_doc_format(
+	pub(crate) fn derive_doc_format(
 		media_type: Option<&str>,
 		filename: Option<&str>,
 	) -> Result<&'static str, AIError> {
@@ -2436,7 +2490,7 @@ pub mod from_responses {
 	// Bedrock document names may only contain alphanumerics, whitespace, hyphens,
 	// parentheses, and square brackets, with no consecutive whitespace. Notably this
 	// excludes periods, so "notes.txt" must be rewritten before sending.
-	fn sanitize_doc_name(filename: Option<&str>) -> String {
+	pub(crate) fn sanitize_doc_name(filename: Option<&str>) -> String {
 		let Some(name) = filename else {
 			return "document".to_string();
 		};
