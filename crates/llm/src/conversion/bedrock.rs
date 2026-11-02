@@ -1634,11 +1634,10 @@ pub mod from_messages {
 			let mut bedrock_tools = Vec::with_capacity(tools.len());
 			for tool in tools {
 				let messages::Tool::Custom(tool) = tool else {
-					// Bedrock's Converse API has no native equivalent of an Anthropic server tool
-					// (e.g. web_search_20250305) executing upstream of the model. Drop it rather
-					// than fail the whole request; the model just won't see this tool offered.
-					tracing::debug!("Unsupported server tool in Bedrock conversion: {:?}", tool);
-					continue;
+					return Err(AIError::UnsupportedConversion(strng::format!(
+						"anthropic server-side tool '{}' is not supported by the Bedrock Converse API",
+						tool.name()
+					)));
 				};
 				bedrock_tools.push((
 					bedrock::Tool::ToolSpec(bedrock::ToolSpecification {

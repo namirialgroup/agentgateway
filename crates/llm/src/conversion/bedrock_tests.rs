@@ -2059,6 +2059,30 @@ fn test_responses_input_file_unknown_format_is_rejected() {
 	);
 }
 
+#[test]
+fn test_messages_native_web_search_is_rejected_explicitly() {
+	let provider = Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+	};
+	let req: types::messages::Request = serde_json::from_value(json!({
+		"model": "anthropic.claude-sonnet-5-5",
+		"max_tokens": 16,
+		"messages": [{"role":"user","content":[{"type":"text","text":"Search for PELICAN-7"}]}],
+		"tools": [{"type":"web_search_20250305","name":"web_search"}]
+	}))
+	.unwrap();
+	let err = super::from_messages::translate(&req, &provider, None, None).unwrap_err();
+	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
+	assert!(
+		err.to_string().contains("server-side tool 'web_search' is not supported"),
+		"unexpected error: {err}"
+	);
+}
+
 // --- Cache-write TTL split (AWS TokenUsage.cacheDetails) — P0-A ------------
 
 #[test]
