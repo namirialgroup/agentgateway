@@ -54,7 +54,8 @@ pub fn strip_internal_response_headers(headers: &mut HeaderMap) {
 		.keys()
 		.filter(|name| {
 			let name = name.as_str();
-			(name.starts_with("x-amzn-")
+			(matches!(name, "fireworks-prompt-tokens" | "traceresponse")
+				|| name.starts_with("x-amzn-")
 				|| name.starts_with("x-aws-")
 				|| name.starts_with("x-envoy-")
 				|| name.starts_with("x-fireworks-")
@@ -343,6 +344,27 @@ mod tests {
 		assert!(!String::from_utf8_lossy(&body).contains("assumed-role"));
 	}
 
+	#[test]
+	fn response_headers_remove_provider_usage_and_trace_headers_on_success_and_error() {
+		for sanitize in [
+			strip_internal_response_headers as fn(&mut HeaderMap),
+			sanitize_headers as fn(&mut HeaderMap),
+		] {
+			let mut headers = HeaderMap::new();
+			headers.insert("fireworks-prompt-tokens", "123".parse().unwrap());
+			headers.insert("traceresponse", "00-private-trace-id-01".parse().unwrap());
+			headers.insert("x-request-id", "public-request-id".parse().unwrap());
+			headers.insert("x-ratelimit-remaining", "9".parse().unwrap());
+			headers.insert("retry-after", "3".parse().unwrap());
+			sanitize(&mut headers);
+			assert!(headers.get("fireworks-prompt-tokens").is_none());
+			assert!(headers.get("traceresponse").is_none());
+			assert_eq!(headers["x-request-id"], "public-request-id");
+			assert_eq!(headers["x-ratelimit-remaining"], "9");
+			assert_eq!(headers["retry-after"], "3");
+		}
+	}
+
 	#[tokio::test]
 	async fn stream_replaces_only_error_events_and_sanitizes_trailers() {
 		let input = format!(
@@ -350,6 +372,8 @@ mod tests {
 		);
 		let mut trailers = HeaderMap::new();
 		trailers.insert("x-amzn-requestid", "private-provider-id".parse().unwrap());
+		trailers.insert("fireworks-prompt-tokens", "123".parse().unwrap());
+		trailers.insert("traceresponse", "00-private-trace-id-01".parse().unwrap());
 		trailers.insert("x-synapse-request-id", "public-synapse-id".parse().unwrap());
 		let frames = vec![
 			Ok::<_, std::io::Error>(http_body::Frame::data(Bytes::from(input))),
@@ -365,6 +389,8 @@ mod tests {
 		let collected = body.collect().await.unwrap();
 		let trailers = collected.trailers().expect("trailers should be preserved");
 		assert!(trailers.get("x-amzn-requestid").is_none());
+		assert!(trailers.get("fireworks-prompt-tokens").is_none());
+		assert!(trailers.get("traceresponse").is_none());
 		assert_eq!(trailers["x-synapse-request-id"], "public-synapse-id");
 		let output = collected.to_bytes();
 		let text = String::from_utf8_lossy(&output);

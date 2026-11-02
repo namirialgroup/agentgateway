@@ -48,6 +48,8 @@ async fn llm_success_response_strips_internal_headers() {
 				.insert_header("x-amzn-requestid", "private-provider-id")
 				.insert_header("x-envoy-upstream-service-time", "12")
 				.insert_header("x-provider-debug", "internal-config")
+				.insert_header("fireworks-prompt-tokens", "123")
+				.insert_header("traceresponse", "00-private-trace-id-01")
 				.set_body_raw(
 					include_bytes!("../../../llm/src/tests/response/completions/basic.json").to_vec(),
 					"application/json",
@@ -72,6 +74,8 @@ async fn llm_success_response_strips_internal_headers() {
 		"x-amzn-requestid",
 		"x-envoy-upstream-service-time",
 		"x-provider-debug",
+		"fireworks-prompt-tokens",
+		"traceresponse",
 	] {
 		assert!(response.headers().get(name).is_none(), "{name} leaked");
 	}
