@@ -2168,8 +2168,8 @@ impl AIProvider {
 
 		// Some Anthropic-compatible clients (e.g. Claude Code) always call
 		// `/v1/messages/count_tokens`. For providers/models without a native
-		// count-tokens endpoint, we must still answer this route, so we fall
-		// back to local token estimation using the normalized messages payload.
+		// count-tokens endpoint, fail explicitly instead of presenting a local
+		// estimate as an exact provider token count.
 		let use_local = !self.supports_format(
 			custom::ProviderFormat::AnthropicTokenCount,
 			req
@@ -2178,18 +2178,18 @@ impl AIProvider {
 				.ok_or_else(|| AIError::MissingField("model not specified".into()))?,
 		);
 		if use_local {
-			let messages = req.get_messages();
-			let model = req.model.as_deref().unwrap_or_default();
-			let count = num_tokens_from_messages(model, &messages)?;
-			let body = serde_json::to_vec(&types::count_tokens::Response {
-				input_tokens: count,
-			})
-			.map_err(AIError::ResponseMarshal)?;
+			let body = serde_json::json!({
+				"type": "error",
+				"error": {
+					"type": "invalid_request_error",
+					"message": "Token counting is not supported for this model or request."
+				}
+			});
 			let resp = ::http::Response::builder()
-				.status(::http::StatusCode::OK)
+				.status(::http::StatusCode::BAD_REQUEST)
 				.header(::http::header::CONTENT_TYPE, "application/json")
-				.body(Body::from(body))
-				.expect("failed to build count_tokens response");
+				.body(Body::from(body.to_string()))
+				.expect("failed to build count_tokens error response");
 			return Ok(RequestResult::Rejected(resp));
 		}
 
