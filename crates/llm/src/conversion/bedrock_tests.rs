@@ -2059,6 +2059,93 @@ fn test_responses_input_file_unknown_format_is_rejected() {
 	);
 }
 
+#[test]
+fn test_messages_pdf_documents_are_preserved_with_unique_names() {
+	let provider = Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+	};
+	let pdf = json!({
+		"type": "document",
+		"source": {
+			"type": "base64",
+			"media_type": "application/pdf",
+			"data": "JVBERi0xLjQKJSBQRUxJQ0FOLTcK"
+		},
+		"title": "report.pdf"
+	});
+	let req: types::messages::Request = serde_json::from_value(json!({
+		"model": "anthropic.claude-sonnet-5-5",
+		"max_tokens": 16,
+		"messages": [
+			{"role":"user","content":[{"type":"text","text":"Read PELICAN-7"}, pdf.clone()]},
+			{"role":"user","content":[{"type":"text","text":"Read it again"}, pdf]}
+		]
+	}))
+	.unwrap();
+	let out = super::from_messages::translate(&req, &provider, None, None).unwrap();
+	let body: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+	let first = &body["messages"][0]["content"][1];
+	assert_eq!(first["document"]["format"], "pdf");
+	assert_eq!(first["document"]["name"], "report");
+	assert_eq!(first["document"]["source"]["bytes"], "JVBERi0xLjQKJSBQRUxJQ0FOLTcK");
+	assert_eq!(body["messages"][1]["content"][1]["document"]["name"], "report [2]");
+}
+
+#[test]
+fn test_messages_non_base64_document_is_rejected_explicitly() {
+	let provider = Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+	};
+	let req: types::messages::Request = serde_json::from_value(json!({
+		"model": "anthropic.claude-sonnet-5-5",
+		"max_tokens": 16,
+		"messages": [{"role":"user","content":[{
+			"type":"document",
+			"source":{"type":"url","url":"https://example.com/report.pdf"},
+			"title":"report.pdf"
+		}]}]
+	}))
+	.unwrap();
+	let err = super::from_messages::translate(&req, &provider, None, None).unwrap_err();
+	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
+	assert!(err.to_string().contains("source type 'url' is unsupported"));
+}
+
+#[test]
+fn test_messages_tool_result_document_is_rejected_before_inference() {
+	let provider = Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+	};
+	let req: types::messages::Request = serde_json::from_value(json!({
+		"model": "anthropic.claude-sonnet-5-5",
+		"max_tokens": 16,
+		"messages": [{"role":"user","content":[{
+			"type":"tool_result",
+			"tool_use_id":"tool-1",
+			"content":[{
+				"type":"document",
+				"source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}
+			}]
+		}]}]
+	}))
+	.unwrap();
+	let err = super::from_messages::translate(&req, &provider, None, None).unwrap_err();
+	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
+	assert!(err.to_string().contains("tool-result document inputs are unsupported"));
+}
+
 // --- Cache-write TTL split (AWS TokenUsage.cacheDetails) — P0-A ------------
 
 #[test]
