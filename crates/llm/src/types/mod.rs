@@ -5,6 +5,7 @@ pub mod detect;
 pub mod embeddings;
 pub mod gemini;
 pub mod messages;
+pub mod public_error;
 pub mod rerank;
 pub mod responses;
 pub mod safeguards;

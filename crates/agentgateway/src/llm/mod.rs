@@ -2827,7 +2827,10 @@ impl AIProvider {
 				model_catalog,
 			));
 		managed_body.replace_bytes(body);
-		let resp = Response::from_parts(parts, managed_body);
+		let resp = {
+			sanitize_error_response(&mut parts);
+			Response::from_parts(parts, managed_body)
+		};
 
 		if !rate_limit.local_rate_limit.is_empty() || rate_limit.remote_rate_limit.is_some() {
 			let exec = cel::Executor::new_response(req_snapshot.as_deref(), &resp);
@@ -2887,7 +2890,10 @@ impl AIProvider {
 			));
 		log.store(Some(llm_info));
 		managed_body.replace_bytes(bytes);
-		Response::from_parts(parts, managed_body)
+		{
+			sanitize_error_response(&mut parts);
+			Response::from_parts(parts, managed_body)
+		}
 	}
 
 	fn process_count_tokens_response(
@@ -3431,6 +3437,12 @@ impl AIProvider {
 			}
 		};
 
+		let translated = if input_format.is_chat() {
+			translated.map(|body| types::public_error::sanitize_stream(input_format, body, buffer))
+		} else {
+			translated
+		};
+
 		// Claude Code safeguards: hold the final `message_delta` of a locally
 		// handled Messages stream until the tool uses are classified, then stamp
 		// `safeguard_results` into it (shadow mode never holds). The usage
@@ -3602,6 +3614,32 @@ impl AIProvider {
 		bytes: &Bytes,
 		catalog: agent_llm::model_catalog::Catalog<'_>,
 	) -> Result<Bytes, AIError> {
+		let translated = self
+			.process_error_inner(req, status, bytes, catalog)
+			.unwrap_or_else(|error| {
+				warn!(
+					provider = %req.provider,
+					input_format = ?req.input_format,
+					%status,
+					%error,
+					"failed to translate upstream error; returning a typed public error"
+				);
+				Bytes::new()
+			});
+		Ok(types::public_error::upstream_error(
+			req.input_format,
+			status,
+			&translated,
+		))
+	}
+
+	fn process_error_inner(
+		&self,
+		req: &LLMRequest,
+		status: ::http::StatusCode,
+		bytes: &Bytes,
+		catalog: agent_llm::model_catalog::Catalog<'_>,
+	) -> Result<Bytes, AIError> {
 		if req.input_format.is_chat() {
 			let translation = self.chat_translation(req.input_format, &req.request_model, catalog)?;
 			return translation.error(
@@ -3659,6 +3697,18 @@ impl AIProvider {
 			))),
 		}
 	}
+}
+
+fn sanitize_error_response(parts: &mut ::http::response::Parts) {
+	if parts.status.is_success() {
+		return;
+	}
+	parts.status = types::public_error::public_status(parts.status);
+	types::public_error::sanitize_headers(&mut parts.headers);
+	parts.headers.insert(
+		header::CONTENT_TYPE,
+		header::HeaderValue::from_static("application/json"),
+	);
 }
 
 fn query_requests_sse(uri: &::http::Uri) -> bool {

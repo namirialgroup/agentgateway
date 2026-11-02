@@ -1666,17 +1666,8 @@ fn gemini_count_tokens_response_reports_total_tokens() {
 	assert!(resp.headers().get(header::CONTENT_LENGTH).is_none());
 }
 
-#[tokio::test]
-async fn anthropic_count_tokens_preserves_upstream_errors() {
-	let provider = AIProvider::bedrock(bedrock::Provider {
-		model_override: None,
-		region: strng::new("us-east-1"),
-		guardrail_identifier: None,
-		guardrail_version: None,
-		endpoint_preference: Default::default(),
-		transport: Default::default(),
-	});
-	let req = LLMRequest {
+fn count_tokens_request() -> LLMRequest {
+	LLMRequest {
 		input_tokens: None,
 		input_format: InputFormat::CountTokens,
 		cache_convention: CacheTokenConvention::pending(),
@@ -1688,7 +1679,22 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 		provider_state: None,
 		safeguards: None,
 		transport_hints: Default::default(),
-	};
+	}
+}
+
+fn bedrock_provider() -> AIProvider {
+	AIProvider::bedrock(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	})
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_returns_typed_unsupported_error() {
 	let body =
 		bytes::Bytes::from_static(br#"{"message":"The provided model does not support CountTokens"}"#);
 	let mut parts = ::http::Response::new(()).into_parts().0;
@@ -1696,14 +1702,109 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 	let buffered = BufferedResponse {
 		managed_body: Body::empty(),
 		parts,
-		bytes: body.clone(),
+		bytes: body,
 	};
 
-	let resp = provider
-		.process_count_tokens_response(req, buffered, None, &Default::default())
+	let resp = bedrock_provider()
+		.process_count_tokens_response(count_tokens_request(), buffered, None, &Default::default())
 		.expect("error response should process");
 	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
-	assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), body);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert_eq!(
+		error["error"]["message"],
+		"Token counting is not supported for this model or request."
+	);
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_preserves_upstream_errors() {
+	let body =
+		bytes::Bytes::from_static(br#"{"message":"The provided model does not support CountTokens"}"#);
+	let mut parts = ::http::Response::new(()).into_parts().0;
+	parts.status = ::http::StatusCode::BAD_REQUEST;
+	let buffered = BufferedResponse {
+		managed_body: Body::empty(),
+		parts,
+		bytes: body,
+	};
+	let resp = bedrock_provider()
+		.process_count_tokens_response(count_tokens_request(), buffered, None, &Default::default())
+		.expect("error response should process");
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert_eq!(
+		error["error"]["message"],
+		"Token counting is not supported for this model or request."
+	);
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_redacts_iam_error_and_debug_headers() {
+	let body = bytes::Bytes::from_static(
+		br#"{"message":"User: arn:aws:sts::123456789012:assumed-role/prod-agentgateway-bedrock-irsa/session is not authorized to perform: bedrock:CountTokens on bedrock-runtime.eu-west-1.amazonaws.com"}"#,
+	);
+	let mut parts = ::http::Response::new(()).into_parts().0;
+	parts.status = ::http::StatusCode::FORBIDDEN;
+	parts
+		.headers
+		.insert("x-amzn-requestid", "private-aws-id".parse().unwrap());
+	parts
+		.headers
+		.insert("x-amzn-errortype", "AccessDeniedException".parse().unwrap());
+	parts
+		.headers
+		.insert("x-envoy-upstream-service-time", "12".parse().unwrap());
+	parts
+		.headers
+		.insert("x-request-id", "public-correlation-id".parse().unwrap());
+	parts.headers.insert("retry-after", "3".parse().unwrap());
+	parts
+		.headers
+		.insert("x-ratelimit-remaining", "0".parse().unwrap());
+	let buffered = BufferedResponse {
+		managed_body: Body::empty(),
+		parts,
+		bytes: body,
+	};
+
+	let resp = bedrock_provider()
+		.process_count_tokens_response(count_tokens_request(), buffered, None, &Default::default())
+		.expect("error response should process");
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_GATEWAY);
+	assert_eq!(resp.headers()["x-request-id"], "public-correlation-id");
+	assert_eq!(resp.headers()["retry-after"], "3");
+	assert_eq!(resp.headers()["x-ratelimit-remaining"], "0");
+	assert!(resp.headers().get("x-amzn-requestid").is_none());
+	assert!(resp.headers().get("x-amzn-errortype").is_none());
+	assert!(
+		resp
+			.headers()
+			.get("x-envoy-upstream-service-time")
+			.is_none()
+	);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let text = String::from_utf8_lossy(&body);
+	for marker in [
+		"123456789012",
+		"assumed-role",
+		"prod-agentgateway-bedrock-irsa",
+		"bedrock:CountTokens",
+		"bedrock-runtime.eu-west-1.amazonaws.com",
+	] {
+		assert!(
+			!text.contains(marker),
+			"public body leaked {marker}: {text}"
+		);
+	}
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "api_error");
 }
 
 #[tokio::test]
@@ -2574,7 +2675,7 @@ fn test_messages_output_config_format_maps_to_openai_response_format() {
 ///
 /// Constructs a Bedrock 400 JSON error response and passes it through
 /// `process_response` with a streaming `LLMRequest`. Asserts the returned
-/// body is non-empty, valid JSON, and preserves the original error message.
+/// body is non-empty, valid JSON, and contains only the typed public error.
 #[tokio::test]
 async fn process_response_routes_streaming_error_to_buffered_path() {
 	use crate::proxy::httpproxy::PolicyClient;
@@ -2643,10 +2744,11 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		.pointer("/error/message")
 		.and_then(|v| v.as_str())
 		.unwrap_or_default();
-	assert!(
-		message.contains("toolResult"),
-		"translated error should preserve the original message, got: {message}",
+	assert_eq!(
+		message, "The upstream provider rejected the request as invalid.",
+		"translated error should be public and typed"
 	);
+	assert!(!message.contains("toolResult"));
 }
 
 #[tokio::test]
@@ -2739,7 +2841,10 @@ fn openai_completions_error_translates_to_messages_client() {
 
 	assert_eq!(body["type"], json!("error"));
 	assert_eq!(body["error"]["type"], json!("invalid_request_error"));
-	assert_eq!(body["error"]["message"], json!("bad request"));
+	assert_eq!(
+		body["error"]["message"],
+		json!("The upstream provider rejected the request as invalid.")
+	);
 }
 
 #[tokio::test]
@@ -2755,14 +2860,14 @@ async fn context_overflow_reaches_messages_client_with_status_and_request_id() {
 			"gpt-6-astra",
 			ChatFormat::OpenAIResponses,
 			json!({"message": "Your input exceeds the context window of this model. Please adjust your input and try again."}),
-			"capability_rejected: prompt_too_long Your input exceeds the context window of this model. Please adjust your input and try again.",
+			"capability_rejected: prompt_too_long Input exceeds the model context window.",
 		),
 		(
 			custom_provider(custom::ProviderFormat::Completions),
 			"gpt-4o",
 			ChatFormat::OpenAICompletions,
 			json!({"type": "invalid_request_error", "code": "context_length_exceeded", "message": "input rejected"}),
-			"capability_rejected: prompt_too_long input rejected",
+			"capability_rejected: prompt_too_long Input exceeds the model context window.",
 		),
 	] {
 		assert_eq!(
@@ -2828,7 +2933,10 @@ fn custom_messages_error_translates_to_completions_client() {
 	let body: Value = serde_json::from_slice(&translated).expect("translated error should be JSON");
 
 	assert_eq!(body["error"]["type"], json!("invalid_request_error"));
-	assert_eq!(body["error"]["message"], json!("bad request"));
+	assert_eq!(
+		body["error"]["message"],
+		json!("The upstream provider rejected the request as invalid.")
+	);
 }
 
 #[test]
@@ -2854,7 +2962,10 @@ fn foundry_claude_messages_error_uses_anthropic_shape() {
 
 	assert_eq!(body["type"], json!("error"));
 	assert_eq!(body["error"]["type"], json!("invalid_request_error"));
-	assert_eq!(body["error"]["message"], json!("bad request"));
+	assert_eq!(
+		body["error"]["message"],
+		json!("The upstream provider rejected the request as invalid.")
+	);
 }
 
 #[tokio::test]

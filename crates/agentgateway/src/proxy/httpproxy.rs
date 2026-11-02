@@ -772,11 +772,19 @@ impl HTTPProxy {
 		// or direct responses
 		let mut response_policies = ResponsePolicies::default();
 		let is_grpc_request = http::is_grpc_request(&req);
+		let synapse_request_id = req.headers().get("x-synapse-request-id").cloned();
+		let client_request_id = req.headers().get("x-request-id").cloned();
+		let public_error_format = llm_public_error_format(req.uri().path());
 		let ret = self
 			.proxy_internal(req, log.as_mut().unwrap(), &mut response_policies)
 			.await
 			.map_err(|e| e.0);
-		let (mut resp, mut reason) = resolve_response(ret, log.as_mut().unwrap(), is_grpc_request);
+		let (mut resp, mut reason) = resolve_response(
+			ret,
+			log.as_mut().unwrap(),
+			is_grpc_request,
+			public_error_format,
+		);
 		let is_upstream_response = reason == ProxyResponseReason::Upstream;
 		if let Some(l) = log.as_mut() {
 			l.cel.ctx().maybe_buffer_response_body(&mut resp).await;
@@ -786,7 +794,23 @@ impl HTTPProxy {
 			.apply(&mut resp, log.as_mut().unwrap(), is_upstream_response)
 			.await
 		{
-			(resp, reason) = resolve_response(Err(failure), log.as_mut().unwrap(), is_grpc_request);
+			(resp, reason) = resolve_response(
+				Err(failure),
+				log.as_mut().unwrap(),
+				is_grpc_request,
+				public_error_format,
+			);
+		}
+		llm::types::public_error::strip_internal_response_headers(resp.headers_mut());
+		if !resp.status().is_success() {
+			if let Some(id) = synapse_request_id {
+				resp.headers_mut().insert("x-synapse-request-id", id);
+			}
+			if !resp.headers().contains_key("x-request-id")
+				&& let Some(id) = client_request_id
+			{
+				resp.headers_mut().insert("x-request-id", id);
+			}
 		}
 		// LLM buffering deliberately leaves decoded bodies plain so response policies can safely read
 		// and replace them. Restore the upstream-selected encoding only after every such policy ran.
@@ -2399,6 +2423,35 @@ async fn build_simple_backend_call(
 	Ok((backend_call, maybe_inference))
 }
 
+fn llm_public_error_format(path: &str) -> Option<InputFormat> {
+	let path = path.strip_prefix("/claude").unwrap_or(path);
+	if path == "/v1/messages/count_tokens" {
+		return Some(InputFormat::CountTokens);
+	}
+	if path.starts_with("/v1/messages") {
+		return Some(InputFormat::Messages);
+	}
+	if path.starts_with("/v1/chat/completions") {
+		return Some(InputFormat::Completions);
+	}
+	if path.starts_with("/v1/responses") {
+		return Some(InputFormat::Responses);
+	}
+	if path.starts_with("/v1/embeddings") {
+		return Some(InputFormat::Embeddings);
+	}
+	if path.starts_with("/v1/rerank") {
+		return Some(InputFormat::Rerank);
+	}
+	if path.ends_with(":countTokens") {
+		return Some(InputFormat::GeminiCountTokens);
+	}
+	if path.contains(":generateContent") || path.contains(":streamGenerateContent") {
+		return Some(InputFormat::Gemini);
+	}
+	None
+}
+
 // Explicit policy routes retain their suffix semantics and override native model classification.
 fn resolve_llm_route_type(
 	policy: Option<&llm::Policy>,
@@ -3745,6 +3798,7 @@ pub(crate) fn resolve_response(
 	result: Result<Response, ProxyResponse>,
 	log: &mut RequestLog,
 	is_grpc_request: bool,
+	llm_format: Option<InputFormat>,
 ) -> (Response, ProxyResponseReason) {
 	let reason = match &result {
 		Ok(_) => ProxyResponseReason::Upstream,
@@ -3768,7 +3822,7 @@ pub(crate) fn resolve_response(
 	log.reason = Some(reason);
 	log.error = error.as_ref().map(|error| error.message.clone());
 	let mut response = result.unwrap_or_else(|failure| match failure {
-		ProxyResponse::Error(error) => error.into_response_with_grpc(is_grpc_request),
+		ProxyResponse::Error(error) => error.into_response_with_llm_format(is_grpc_request, llm_format),
 		ProxyResponse::DirectResponse(response) => *response,
 	});
 	if let Some(error) = error {

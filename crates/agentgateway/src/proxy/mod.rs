@@ -376,6 +376,14 @@ impl ProxyError {
 		}
 	}
 	pub fn into_response_with_grpc(self, is_grpc_request: bool) -> Response {
+		self.into_response_with_llm_format(is_grpc_request, None)
+	}
+
+	pub fn into_response_with_llm_format(
+		self,
+		is_grpc_request: bool,
+		llm_format: Option<llm::InputFormat>,
+	) -> Response {
 		let msg = self.to_string();
 		let code = match self {
 			ProxyError::BindNotFound => StatusCode::NOT_FOUND,
@@ -579,6 +587,19 @@ impl ProxyError {
 					.to_string(),
 				))
 				.expect("budget exceeded response is valid");
+		}
+
+		let local_ai_error = match &self {
+			ProxyError::AIRequest(error) | ProxyError::AIResponse(error) => Some(error),
+			_ => None,
+		};
+		if let (Some(format), Some(error)) = (llm_format, local_ai_error) {
+			return rb
+				.header(hyper::header::CONTENT_TYPE, "application/json")
+				.body(http::Body::from(llm::types::public_error::local_error(
+					format, code, error,
+				)))
+				.expect("public LLM error response is valid");
 		}
 
 		// Add WWW-Authenticate header for MCP failures
@@ -900,6 +921,37 @@ mod tests {
 			StatusCode::INTERNAL_SERVER_ERROR,
 			ProxyResponseReason::Internal,
 		);
+	}
+
+	#[tokio::test]
+	async fn local_llm_errors_are_protocol_typed_and_redacted() {
+		use http_body_util::BodyExt;
+
+		for format in [llm::InputFormat::Messages, llm::InputFormat::Completions] {
+			let parse_error = serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+			let response = ProxyError::AIRequest(llm::AIError::RequestParsing(format, parse_error))
+				.into_response_with_llm_format(false, Some(format));
+			assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+			assert_eq!(
+				response.headers()[hyper::header::CONTENT_TYPE],
+				"application/json"
+			);
+			let body = response.into_body().collect().await.unwrap().to_bytes();
+			let text = String::from_utf8_lossy(&body);
+			assert!(!text.contains("EOF"));
+			assert!(!text.contains("line 1"));
+			let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+			if format == llm::InputFormat::Messages {
+				assert_eq!(error["type"], "error");
+				assert_eq!(error["error"]["type"], "invalid_request_error");
+			} else {
+				assert_eq!(error["error"]["type"], "invalid_request_error");
+			}
+			assert_eq!(
+				error["error"]["message"],
+				"The request body is not valid for this endpoint."
+			);
+		}
 	}
 
 	#[test]
