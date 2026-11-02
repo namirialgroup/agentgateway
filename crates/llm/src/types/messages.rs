@@ -1794,7 +1794,7 @@ pub mod typed {
 	/// An Anthropic server-executed tool (runs upstream of the provider, e.g. `web_search_20250305`).
 	/// We don't model every server tool's specific fields — just enough to round-trip the block
 	/// without failing deserialization. Providers that can't execute a server tool (e.g. Bedrock)
-	/// drop it rather than crash the whole request; see `conversion::bedrock`.
+	/// reject the request explicitly rather than silently changing its semantics; see `conversion::bedrock`.
 	#[derive(Debug, Serialize, Deserialize)]
 	pub struct ServerTool {
 		/// Discriminant, e.g. "web_search_20250305"
