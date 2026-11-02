@@ -113,6 +113,8 @@ pub enum ToolResultContentBlock {
 	Text(String),
 	/// A tool result that is an image.
 	Image(ImageBlock),
+	/// A tool result that is a document.
+	Document(DocumentBlock),
 	/// A tool result that is JSON format data.
 	Json(serde_json::Value),
 	/// A tool result that is video.

@@ -2091,8 +2091,14 @@ fn test_messages_pdf_documents_are_preserved_with_unique_names() {
 	let first = &body["messages"][0]["content"][1];
 	assert_eq!(first["document"]["format"], "pdf");
 	assert_eq!(first["document"]["name"], "report");
-	assert_eq!(first["document"]["source"]["bytes"], "JVBERi0xLjQKJSBQRUxJQ0FOLTcK");
-	assert_eq!(body["messages"][1]["content"][1]["document"]["name"], "report [2]");
+	assert_eq!(
+		first["document"]["source"]["bytes"],
+		"JVBERi0xLjQKJSBQRUxJQ0FOLTcK"
+	);
+	assert_eq!(
+		body["messages"][1]["content"][1]["document"]["name"],
+		"report [2]"
+	);
 }
 
 #[test]
@@ -2120,7 +2126,50 @@ fn test_messages_non_base64_document_is_rejected_explicitly() {
 }
 
 #[test]
-fn test_messages_tool_result_document_is_rejected_before_inference() {
+fn test_messages_tool_result_document_is_preserved_for_claude_code_read() {
+	let provider = Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+	};
+	let req: types::messages::Request = serde_json::from_value(json!({
+		"model": "anthropic.claude-sonnet-5-5",
+		"max_tokens": 16,
+		"messages": [
+			{"role":"user","content":[{"type":"text","text":"Read the PDF"}]},
+			{"role":"assistant","content":[{
+				"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"/tmp/report.pdf"}
+			}]},
+			{"role":"user","content":[{
+				"type":"tool_result",
+				"tool_use_id":"tool-1",
+				"content":[
+					{"type":"text","text":"PDF pages: 1"},
+					{
+						"type":"document",
+						"source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQKJSBQRUxJQ0FOLTcK"}
+					}
+				]
+			}]}
+		]
+	}))
+	.unwrap();
+	let out = super::from_messages::translate(&req, &provider, None, None).unwrap();
+	let body: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+	let content = &body["messages"][2]["content"][0]["toolResult"]["content"];
+	assert_eq!(content[0]["text"], "PDF pages: 1");
+	assert_eq!(content[1]["document"]["format"], "pdf");
+	assert_eq!(content[1]["document"]["name"], "document");
+	assert_eq!(
+		content[1]["document"]["source"]["bytes"],
+		"JVBERi0xLjQKJSBQRUxJQ0FOLTcK"
+	);
+}
+
+#[test]
+fn test_messages_tool_result_non_base64_document_is_rejected() {
 	let provider = Provider {
 		model_override: None,
 		region: strng::new("us-east-1"),
@@ -2136,14 +2185,14 @@ fn test_messages_tool_result_document_is_rejected_before_inference() {
 			"tool_use_id":"tool-1",
 			"content":[{
 				"type":"document",
-				"source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}
+				"source":{"type":"url","url":"https://example.com/report.pdf"}
 			}]
 		}]}]
 	}))
 	.unwrap();
 	let err = super::from_messages::translate(&req, &provider, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
-	assert!(err.to_string().contains("tool-result document inputs are unsupported"));
+	assert!(err.to_string().contains("source type 'url' is unsupported"));
 }
 
 // --- Cache-write TTL split (AWS TokenUsage.cacheDetails) — P0-A ------------
