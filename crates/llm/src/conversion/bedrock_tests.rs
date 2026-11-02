@@ -2096,6 +2096,7 @@ fn test_messages_pdf_documents_are_preserved_with_unique_names() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 	let pdf = json!({
 		"type": "document",
@@ -2138,6 +2139,7 @@ fn test_messages_non_base64_document_is_rejected_explicitly() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 	let req: types::messages::Request = serde_json::from_value(json!({
 		"model": "anthropic.claude-sonnet-5-5",
@@ -2162,6 +2164,7 @@ fn test_messages_tool_result_document_is_preserved_for_claude_code_read() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 	let req: types::messages::Request = serde_json::from_value(json!({
 		"model": "anthropic.claude-sonnet-5-5",
@@ -2205,6 +2208,7 @@ fn test_messages_tool_result_non_base64_document_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 	let req: types::messages::Request = serde_json::from_value(json!({
 		"model": "anthropic.claude-sonnet-5-5",
@@ -2232,6 +2236,7 @@ fn test_messages_native_web_search_is_rejected_explicitly() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 	let req: types::messages::Request = serde_json::from_value(json!({
 		"model": "anthropic.claude-sonnet-5-5",
