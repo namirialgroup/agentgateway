@@ -4797,6 +4797,7 @@ async fn builtin_web_search_to_bedrock_is_rejected_before_downgrade() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
 	}));
 	let body = json!({
 		"model": "anthropic.claude-sonnet-5-5",
