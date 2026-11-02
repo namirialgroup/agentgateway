@@ -56,6 +56,7 @@ pub fn strip_internal_response_headers(headers: &mut HeaderMap) {
 		.filter(|name| {
 			let name = name.as_str();
 			(matches!(name, "server" | "trailer" | "fireworks-prompt-tokens" | "traceresponse")
+
 				|| name.starts_with("x-amzn-")
 				|| name.starts_with("x-aws-")
 				|| name.starts_with("x-envoy-")
