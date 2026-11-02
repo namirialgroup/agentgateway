@@ -34,6 +34,7 @@ pub fn sanitize_headers(headers: &mut HeaderMap) {
 					| "vary"
 					| "retry-after"
 					| "retry-after-ms"
+					| "request-id"
 					| "x-request-id"
 					| "x-synapse-request-id"
 					| "x-synapse-client-request-id"
@@ -54,7 +55,7 @@ pub fn strip_internal_response_headers(headers: &mut HeaderMap) {
 		.keys()
 		.filter(|name| {
 			let name = name.as_str();
-			(matches!(name, "fireworks-prompt-tokens" | "traceresponse")
+			(matches!(name, "server" | "fireworks-prompt-tokens" | "traceresponse")
 				|| name.starts_with("x-amzn-")
 				|| name.starts_with("x-aws-")
 				|| name.starts_with("x-envoy-")
@@ -351,14 +352,18 @@ mod tests {
 			sanitize_headers as fn(&mut HeaderMap),
 		] {
 			let mut headers = HeaderMap::new();
+			headers.insert("server", "internal-upstream-implementation".parse().unwrap());
 			headers.insert("fireworks-prompt-tokens", "123".parse().unwrap());
 			headers.insert("traceresponse", "00-private-trace-id-01".parse().unwrap());
+			headers.insert("request-id", "anthropic-contract-id".parse().unwrap());
 			headers.insert("x-request-id", "public-request-id".parse().unwrap());
 			headers.insert("x-ratelimit-remaining", "9".parse().unwrap());
 			headers.insert("retry-after", "3".parse().unwrap());
 			sanitize(&mut headers);
+			assert!(headers.get("server").is_none());
 			assert!(headers.get("fireworks-prompt-tokens").is_none());
 			assert!(headers.get("traceresponse").is_none());
+			assert_eq!(headers["request-id"], "anthropic-contract-id");
 			assert_eq!(headers["x-request-id"], "public-request-id");
 			assert_eq!(headers["x-ratelimit-remaining"], "9");
 			assert_eq!(headers["retry-after"], "3");
