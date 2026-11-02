@@ -1376,6 +1376,45 @@ async fn count_tokens_uses_native_endpoint_after_model_alias() {
 	assert_eq!(llm_request.request_model, "claude-3-5-sonnet");
 }
 
+#[tokio::test]
+async fn count_tokens_without_native_endpoint_is_explicitly_rejected() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	let provider = custom_provider(custom::ProviderFormat::Completions);
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("localhost", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"test-model","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+	let RequestResult::Rejected(response) = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("unsupported count_tokens should return a typed error")
+	else {
+		panic!("expected direct rejection");
+	};
+	assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = response.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert_eq!(
+		error["error"]["message"],
+		"Token counting is not supported for this model or request."
+	);
+	assert!(error.get("input_tokens").is_none());
+}
+
 fn gemini_generate_content_request(uri: &str) -> ::http::Request<Body> {
 	::http::Request::builder()
 		.uri(uri)
