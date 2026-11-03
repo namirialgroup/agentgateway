@@ -54,6 +54,14 @@ pub enum BedrockEndpoint {
 // Mantle signs SigV4 under this name instead of the default "bedrock".
 const MANTLE_SIGNING_SERVICE_NAME: &str = "bedrock-mantle";
 
+/// Environment override for the bedrock-mantle endpoint Region (host AND SigV4
+/// signing region). bedrock-mantle serves Claude models In-Region in a small
+/// set of Regions that differs per model (model cards; e.g. Opus 5.5:
+/// us-east-1 / ap-southeast-4, Sonnet 5.5: none commercial at card time), so a
+/// gateway running elsewhere (our eu-west-1) must call a supported Region.
+/// Read per call (not cached) so tests and rolling config stay independent.
+const MANTLE_REGION_ENV: &str = "AGENTGATEWAY_BEDROCK_MANTLE_REGION";
+
 #[apply(schema!)]
 #[cfg_attr(feature = "schema", schemars(rename = "BedrockProviderConfig"))]
 pub struct Provider {
@@ -102,8 +110,26 @@ impl Provider {
 			},
 			RT::Models => BedrockEndpoint::Mantle,
 			RT::Detect | RT::Passthrough | RT::GenerateContent => BedrockEndpoint::Runtime,
-			// Chat, and Anthropic count-tokens, follow the model's endpoint: Runtime's Converse /
-			// CountTokens APIs, or Mantle's native OpenAI/Anthropic APIs.
+			// Claude models that launch CRIS-only on bedrock-runtime (geo-prefixed
+			// inference profiles such as global.anthropic.claude-*-5-5) have no
+			// Region-specific CountTokens surface there — the Runtime CountTokens
+			// API denies them (AWS model cards). bedrock-mantle serves Anthropic's
+			// native count_tokens for every Claude model, so Anthropic count-tokens
+			// routes there regardless of the CHAT transport (NativeMessages forces
+			// Runtime for chat only; count-tokens is transport-independent). An
+			// explicit RuntimeOnly pin stays honored.
+			RT::AnthropicTokenCount
+				if model_id.is_some_and(|m| self.is_anthropic_model(m))
+					&& !matches!(
+						self.endpoint_preference,
+						BedrockEndpointPreference::RuntimeOnly
+					) =>
+			{
+				BedrockEndpoint::Mantle
+			},
+			// Chat (and Anthropic count-tokens under an explicit RuntimeOnly pin)
+			// follows the model's endpoint: Runtime's Converse / CountTokens APIs,
+			// or Mantle's native OpenAI/Anthropic APIs.
 			RT::Completions | RT::Messages | RT::Responses | RT::AnthropicTokenCount => {
 				self.chat_endpoint(model_id, catalog)
 			},
@@ -245,13 +271,26 @@ impl Provider {
 		}
 	}
 
+	/// Region whose bedrock-mantle endpoint serves this provider: the
+	/// `AGENTGATEWAY_BEDROCK_MANTLE_REGION` override when set, else the
+	/// provider's own Region. Used for the mantle host and its SigV4 signing
+	/// region.
+	pub fn mantle_region(&self) -> String {
+		std::env::var(MANTLE_REGION_ENV)
+			.ok()
+			.filter(|r| !r.is_empty())
+			.unwrap_or_else(|| self.region.as_str().to_owned())
+	}
+
 	pub fn get_host(&self, route_type: super::RouteType, endpoint: BedrockEndpoint) -> Strng {
 		// Rerank always uses the agent-runtime host, independent of endpoint choice.
 		if matches!(route_type, super::RouteType::Rerank) {
 			return strng::format!("bedrock-agent-runtime.{}.amazonaws.com", self.region);
 		}
 		match endpoint {
-			BedrockEndpoint::Mantle => strng::format!("bedrock-mantle.{}.api.aws", self.region),
+			BedrockEndpoint::Mantle => {
+				strng::format!("bedrock-mantle.{}.api.aws", self.mantle_region())
+			},
 			BedrockEndpoint::Runtime => {
 				strng::format!("bedrock-runtime.{}.amazonaws.com", self.region)
 			},
@@ -279,6 +318,26 @@ mod tests {
 		let mut p = provider(pref);
 		p.transport = BedrockTransport::NativeMessages;
 		p
+	}
+
+	/// Scoped test guard for `AGENTGATEWAY_BEDROCK_MANTLE_REGION`: sets the
+	/// override and removes it on drop, so parallel tests observe the default
+	/// again as soon as the guarded test ends.
+	struct MantleRegionOverrideGuard;
+
+	impl MantleRegionOverrideGuard {
+		fn set(region: &str) -> Self {
+			// Same single-test scoped pattern as the tool-search env guard:
+			// the override lives only for the duration of this test.
+			unsafe { std::env::set_var(MANTLE_REGION_ENV, region) };
+			Self
+		}
+	}
+
+	impl Drop for MantleRegionOverrideGuard {
+		fn drop(&mut self) {
+			unsafe { std::env::remove_var(MANTLE_REGION_ENV) };
+		}
 	}
 
 	#[test]
@@ -310,6 +369,99 @@ mod tests {
 		assert_eq!(
 			p.resolve_endpoint(RouteType::Models, None, None),
 			BedrockEndpoint::Mantle
+		);
+	}
+
+	#[test]
+	fn resolve_endpoint_routes_anthropic_count_tokens_to_mantle() {
+		// CRIS-only Claude models (geo inference profiles) have no CountTokens
+		// surface on bedrock-runtime; the Anthropic-native count_tokens API on
+		// bedrock-mantle is the documented surface for them.
+		let p = provider(BedrockEndpointPreference::RuntimePreferred);
+		for model in [
+			"global.anthropic.claude-opus-5-5",
+			"global.anthropic.claude-sonnet-5-5",
+			"eu.anthropic.claude-sonnet-4-6",
+			"us.anthropic.claude-haiku-4-5-20251001-v1:0",
+			"anthropic.claude-3-5-sonnet-20241022-v2:0",
+		] {
+			assert_eq!(
+				p.resolve_endpoint(RouteType::AnthropicTokenCount, Some(model), None),
+				BedrockEndpoint::Mantle,
+				"model={model}"
+			);
+		}
+		// Count-tokens rides Mantle even when the chat transport is native:
+		// the transport selector forces Runtime for chat only.
+		let native = native_provider(BedrockEndpointPreference::RuntimePreferred);
+		assert_eq!(
+			native.resolve_endpoint(
+				RouteType::AnthropicTokenCount,
+				Some("global.anthropic.claude-opus-5-5"),
+				None
+			),
+			BedrockEndpoint::Mantle
+		);
+		assert_eq!(
+			native.resolve_endpoint(
+				RouteType::Messages,
+				Some("global.anthropic.claude-opus-5-5"),
+				None
+			),
+			BedrockEndpoint::Runtime
+		);
+		// Chat and non-Anthropic count-tokens keep their current resolution.
+		assert_eq!(
+			p.resolve_endpoint(
+				RouteType::Messages,
+				Some("global.anthropic.claude-opus-5-5"),
+				None
+			),
+			BedrockEndpoint::Runtime
+		);
+		assert_eq!(
+			p.resolve_endpoint(
+				RouteType::AnthropicTokenCount,
+				Some("openai.gpt-6-luna"),
+				None
+			),
+			BedrockEndpoint::Runtime
+		);
+	}
+
+	#[test]
+	fn mantle_host_and_signing_region_follow_override() {
+		let p = provider(BedrockEndpointPreference::RuntimePreferred);
+		// Default: the mantle host lives in the provider's own region…
+		assert_eq!(
+			p.get_host(RouteType::Messages, BedrockEndpoint::Mantle),
+			"bedrock-mantle.us-east-1.api.aws"
+		);
+		// …unless the mantle region override points at a region that
+		// actually serves the model In-Region (per-model card). The
+		// override drives the host AND the SigV4 signing region (see
+		// setup_request); the Runtime host never follows it.
+		let _guard = MantleRegionOverrideGuard::set("eu-west-1");
+		assert_eq!(
+			p.get_host(RouteType::Messages, BedrockEndpoint::Mantle),
+			"bedrock-mantle.eu-west-1.api.aws"
+		);
+		assert_eq!(
+			p.get_host(RouteType::Messages, BedrockEndpoint::Runtime),
+			"bedrock-runtime.us-east-1.amazonaws.com"
+		);
+	}
+
+	#[test]
+	fn resolve_endpoint_runtime_only_pin_keeps_runtime_count_tokens() {
+		let p = provider(BedrockEndpointPreference::RuntimeOnly);
+		assert_eq!(
+			p.resolve_endpoint(
+				RouteType::AnthropicTokenCount,
+				Some("global.anthropic.claude-opus-5-5"),
+				None
+			),
+			BedrockEndpoint::Runtime
 		);
 	}
 

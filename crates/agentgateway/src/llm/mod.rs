@@ -1746,8 +1746,14 @@ impl AIProvider {
 			},
 			AIProvider::Bedrock(provider) => http::modify_req(req, |req| {
 				// AWS signing needs the region on every Bedrock request, host override or not.
+				// The mantle endpoint signs with (and lives in) its own region,
+				// which may differ from the provider's Runtime region.
+				let signing_region = match bedrock_endpoint {
+					Some(bedrock::BedrockEndpoint::Mantle) => provider.mantle_region(),
+					_ => provider.region.as_str().to_string(),
+				};
 				req.extensions.insert(bedrock::AwsRegion {
-					region: provider.region.as_str().to_string(),
+					region: signing_region,
 				});
 				// Mantle signs under a different service name; set it here so it survives a host override.
 				if let Some(service) =
@@ -2326,7 +2332,17 @@ impl AIProvider {
 					bedrock::BedrockEndpoint::Mantle
 				) =>
 			{
-				serde_json::to_vec(req).map_err(AIError::RequestMarshal)
+				// bedrock-mantle names base model IDs — never cross-region
+				// inference profiles — so strip the geo prefix (global./eu./us.…
+				// → anthropic.…) from the body model. The caller-facing alias
+				// and every other field pass through verbatim.
+				let mut mantle_req = req.clone();
+				if let Some((_, base)) = request_model.split_once('.') {
+					if base.starts_with("anthropic.") {
+						mantle_req.model = Some(base.to_string());
+					}
+				}
+				serde_json::to_vec(&mantle_req).map_err(AIError::RequestMarshal)
 			},
 			AIProvider::Bedrock(_) => {
 				conversion::bedrock::from_anthropic_token_count::translate(req, headers)
