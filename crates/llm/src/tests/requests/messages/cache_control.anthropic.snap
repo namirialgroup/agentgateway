@@ -11,6 +11,7 @@ info:
       text: Second system block
       cache_control:
         type: ephemeral
+        ttl: 1h
   messages:
     - role: assistant
       content:
@@ -26,6 +27,7 @@ info:
           text: Cached user text
           cache_control:
             type: ephemeral
+            ttl: 1h
         - type: image
           source:
             type: base64
@@ -105,6 +107,7 @@ info:
         properties: {}
       cache_control:
         type: ephemeral
+        ttl: 1h
 ---
 {
   "request": {
@@ -132,7 +135,8 @@ info:
             "type": "text",
             "text": "Cached user text",
             "cache_control": {
-              "type": "ephemeral"
+              "type": "ephemeral",
+              "ttl": "1h"
             }
           },
           {
@@ -271,7 +275,8 @@ info:
         "type": "text",
         "text": "Second system block",
         "cache_control": {
-          "type": "ephemeral"
+          "type": "ephemeral",
+          "ttl": "1h"
         }
       }
     ],
@@ -285,7 +290,8 @@ info:
           "properties": {}
         },
         "cache_control": {
-          "type": "ephemeral"
+          "type": "ephemeral",
+          "ttl": "1h"
         }
       }
     ]

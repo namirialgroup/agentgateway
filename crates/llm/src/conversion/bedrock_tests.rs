@@ -2219,3 +2219,392 @@ fn test_converse_response_carries_ttl_split_into_llm_response() {
 	assert_eq!(llm.cache_creation_5m_input_tokens, None);
 	assert_eq!(llm.cache_creation_1h_input_tokens, None);
 }
+
+// ---- Client cache_control.ttl forwarding onto Converse cache points ----
+// Validation matrix for the TTL parity fix: every checkpoint surface, the
+// nested tool_result characterization, ordering pass-through and the cap-4
+// invariant. Authoritative Bedrock usage is asserted separately by the
+// stable-prefix acceptance probe; these tests pin the request serialization.
+
+fn ttl_test_provider() -> Provider {
+	Provider {
+		model_override: None,
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	}
+}
+
+fn ttl_marker(ttl: Option<&str>) -> Option<types::messages::typed::CacheControlEphemeral> {
+	Some(types::messages::typed::CacheControlEphemeral::Ephemeral {
+		ttl: ttl.map(str::to_string),
+	})
+}
+
+fn ttl_text_block(text: &str, ttl: Option<&str>) -> types::messages::typed::ContentBlock {
+	types::messages::typed::ContentBlock::Text(types::messages::typed::ContentTextBlock {
+		text: text.to_string(),
+		citations: None,
+		cache_control: ttl_marker(ttl),
+	})
+}
+
+fn unmarked_text_block(text: &str) -> types::messages::typed::ContentBlock {
+	types::messages::typed::ContentBlock::Text(types::messages::typed::ContentTextBlock {
+		text: text.to_string(),
+		citations: None,
+		cache_control: None,
+	})
+}
+
+fn ttl_cache_points(
+	content: &[types::bedrock::ContentBlock],
+) -> Vec<&types::bedrock::CachePointBlock> {
+	content
+		.iter()
+		.filter_map(|block| match block {
+			types::bedrock::ContentBlock::CachePoint(cache_point) => Some(cache_point),
+			_ => None,
+		})
+		.collect()
+}
+
+#[test]
+fn test_cache_control_ttl_helper_variants() {
+	assert_eq!(helpers::cache_control_ttl(None), None);
+	assert_eq!(helpers::cache_control_ttl(ttl_marker(None).as_ref()), None);
+	assert_eq!(
+		helpers::cache_control_ttl(ttl_marker(Some("5m")).as_ref()),
+		Some("5m".to_string())
+	);
+	assert_eq!(
+		helpers::cache_control_ttl(ttl_marker(Some("1h")).as_ref()),
+		Some("1h".to_string())
+	);
+}
+
+#[test]
+fn test_missing_client_ttl_omits_ttl_field_from_cache_point() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	let req = messages::Request {
+		model: "global.anthropic.claude-sonnet-5-5".to_string(),
+		max_tokens: 64,
+		messages: vec![messages::Message {
+			role: messages::Role::User,
+			content: vec![unmarked_text_block("plain"), ttl_text_block("marked", None)],
+		}],
+		tools: None,
+		tool_choice: None,
+		system: None,
+		metadata: None,
+		stop_sequences: vec![],
+		stream: false,
+		temperature: None,
+		top_p: None,
+		top_k: None,
+		thinking: None,
+		output_config: None,
+	};
+
+	let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+	let points = ttl_cache_points(&out.messages[0].content);
+	assert_eq!(points.len(), 1, "one marked block → one checkpoint");
+	assert_eq!(
+		points[0].ttl, None,
+		"no client ttl → ttl omitted (AWS 5m default)"
+	);
+	// Serialization must omit the field entirely, not emit "ttl": null.
+	let rendered = serde_json::to_value(points[0]).unwrap();
+	assert!(
+		rendered.get("ttl").is_none(),
+		"ttl must be absent, got {rendered}"
+	);
+}
+
+#[test]
+fn test_messages_tool_config_checkpoint_carries_client_ttl() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	let req = messages::Request {
+		model: "global.anthropic.claude-sonnet-5-5".to_string(),
+		max_tokens: 64,
+		messages: vec![messages::Message {
+			role: messages::Role::User,
+			content: vec![ttl_text_block("hello", None)],
+		}],
+		tools: Some(vec![messages::Tool::Custom(messages::CustomTool {
+			strict: None,
+			name: "lookup".to_string(),
+			description: Some("test".to_string()),
+			input_schema: serde_json::json!({"type": "object"}),
+			cache_control: ttl_marker(Some("1h")),
+		})]),
+		tool_choice: None,
+		system: None,
+		metadata: None,
+		stop_sequences: vec![],
+		stream: false,
+		temperature: None,
+		top_p: None,
+		top_k: None,
+		thinking: None,
+		output_config: None,
+	};
+
+	let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+	let tools = out.tool_config.expect("tool config").tools;
+	assert_eq!(tools.len(), 2, "tool spec + cache point");
+	match &tools[1] {
+		types::bedrock::Tool::CachePoint(point) => {
+			assert_eq!(
+				point.ttl.as_deref(),
+				Some("1h"),
+				"tool checkpoint keeps client ttl"
+			);
+		},
+		other => panic!("expected cache point after tool spec, got {other:?}"),
+	}
+}
+
+#[test]
+fn test_tool_use_and_tool_result_checkpoints_carry_client_ttl() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	let req = messages::Request {
+		model: "global.anthropic.claude-sonnet-5-5".to_string(),
+		max_tokens: 64,
+		messages: vec![
+			messages::Message {
+				role: messages::Role::Assistant,
+				content: vec![messages::ContentBlock::ToolUse {
+					id: "call_1".to_string(),
+					name: "lookup".to_string(),
+					input: serde_json::json!({}),
+					cache_control: ttl_marker(Some("1h")),
+				}],
+			},
+			messages::Message {
+				role: messages::Role::User,
+				content: vec![messages::ContentBlock::ToolResult {
+					tool_use_id: "call_1".to_string(),
+					content: messages::ToolResultContent::Text("result".to_string()),
+					is_error: None,
+					cache_control: ttl_marker(Some("1h")),
+				}],
+			},
+		],
+		tools: None,
+		tool_choice: None,
+		system: None,
+		metadata: None,
+		stop_sequences: vec![],
+		stream: false,
+		temperature: None,
+		top_p: None,
+		top_k: None,
+		thinking: None,
+		output_config: None,
+	};
+
+	let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+	let tool_use_points = ttl_cache_points(&out.messages[0].content);
+	assert_eq!(
+		tool_use_points.len(),
+		1,
+		"tool_use outer marker → checkpoint"
+	);
+	assert_eq!(tool_use_points[0].ttl.as_deref(), Some("1h"));
+
+	let tool_result_points = ttl_cache_points(&out.messages[1].content);
+	assert_eq!(
+		tool_result_points.len(),
+		1,
+		"tool_result outer marker → checkpoint"
+	);
+	assert_eq!(tool_result_points[0].ttl.as_deref(), Some("1h"));
+}
+
+#[test]
+fn test_nested_tool_result_marker_inserts_default_ttl_checkpoint() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	let req = messages::Request {
+		model: "global.anthropic.claude-sonnet-5-5".to_string(),
+		max_tokens: 64,
+		messages: vec![messages::Message {
+			role: messages::Role::User,
+			content: vec![messages::ContentBlock::ToolResult {
+				tool_use_id: "call_1".to_string(),
+				content: messages::ToolResultContent::Array(vec![messages::ToolResultContentPart::Text {
+					text: "big tool output".to_string(),
+					citations: None,
+					cache_control: ttl_marker(Some("1h")),
+				}]),
+				is_error: None,
+				cache_control: None,
+			}],
+		}],
+		tools: None,
+		tool_choice: None,
+		system: None,
+		metadata: None,
+		stop_sequences: vec![],
+		stream: false,
+		temperature: None,
+		top_p: None,
+		top_k: None,
+		thinking: None,
+		output_config: None,
+	};
+
+	let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+	let points = ttl_cache_points(&out.messages[0].content);
+	assert_eq!(
+		points.len(),
+		1,
+		"nested marker still creates the checkpoint"
+	);
+	assert_eq!(
+		points[0].ttl, None,
+		"nested-only marker → no forwarded ttl (AWS 5m default); Converse has no per-part ttl, outer marker wins"
+	);
+}
+
+#[test]
+fn test_nested_tool_result_marker_yields_to_outer_ttl() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	let req = messages::Request {
+		model: "global.anthropic.claude-sonnet-5-5".to_string(),
+		max_tokens: 64,
+		messages: vec![messages::Message {
+			role: messages::Role::User,
+			content: vec![messages::ContentBlock::ToolResult {
+				tool_use_id: "call_1".to_string(),
+				content: messages::ToolResultContent::Array(vec![messages::ToolResultContentPart::Text {
+					text: "part".to_string(),
+					citations: None,
+					cache_control: ttl_marker(Some("5m")),
+				}]),
+				is_error: None,
+				cache_control: ttl_marker(Some("1h")),
+			}],
+		}],
+		tools: None,
+		tool_choice: None,
+		system: None,
+		metadata: None,
+		stop_sequences: vec![],
+		stream: false,
+		temperature: None,
+		top_p: None,
+		top_k: None,
+		thinking: None,
+		output_config: None,
+	};
+
+	let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+	let points = ttl_cache_points(&out.messages[0].content);
+	assert_eq!(
+		points.len(),
+		1,
+		"one outer checkpoint, not one per nested marker"
+	);
+	assert_eq!(
+		points[0].ttl.as_deref(),
+		Some("1h"),
+		"outer marker ttl wins"
+	);
+}
+
+#[test]
+fn test_checkpoint_order_and_ttl_pass_through_verbatim() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	// Deliberately include both orderings (1h→5m legal; 5m→1h is the AWS-rejected
+	// ordering reproduced in the Opus 400 class): conversion must not reorder or
+	// normalize; ordering violations are AWS's to reject with a typed error.
+	for ttls in [[Some("1h"), Some("5m")], [Some("5m"), Some("1h")]] {
+		let req = messages::Request {
+			model: "global.anthropic.claude-sonnet-5-5".to_string(),
+			max_tokens: 64,
+			messages: vec![messages::Message {
+				role: messages::Role::User,
+				content: vec![
+					ttl_text_block("first", ttls[0]),
+					ttl_text_block("second", ttls[1]),
+				],
+			}],
+			tools: None,
+			tool_choice: None,
+			system: None,
+			metadata: None,
+			stop_sequences: vec![],
+			stream: false,
+			temperature: None,
+			top_p: None,
+			top_k: None,
+			thinking: None,
+			output_config: None,
+		};
+
+		let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+		let points = ttl_cache_points(&out.messages[0].content);
+		assert_eq!(points.len(), 2, "both checkpoints preserved in order");
+		assert_eq!(points[0].ttl.as_deref(), ttls[0], "first ttl verbatim");
+		assert_eq!(points[1].ttl.as_deref(), ttls[1], "second ttl verbatim");
+	}
+}
+
+#[test]
+fn test_cache_checkpoint_cap_four_silently_skips_excess() {
+	use types::messages::typed as messages;
+
+	let provider = ttl_test_provider();
+	let req = messages::Request {
+		model: "global.anthropic.claude-sonnet-5-5".to_string(),
+		max_tokens: 64,
+		messages: vec![messages::Message {
+			role: messages::Role::User,
+			content: vec![
+				ttl_text_block("one", Some("1h")),
+				ttl_text_block("two", Some("1h")),
+				ttl_text_block("three", Some("1h")),
+				ttl_text_block("four", Some("1h")),
+				ttl_text_block("five", Some("1h")),
+			],
+		}],
+		tools: None,
+		tool_choice: None,
+		system: None,
+		metadata: None,
+		stop_sequences: vec![],
+		stream: false,
+		temperature: None,
+		top_p: None,
+		top_k: None,
+		thinking: None,
+		output_config: None,
+	};
+
+	let (out, _) = from_messages::translate_internal(req, &provider, None, None).unwrap();
+	let points = ttl_cache_points(&out.messages[0].content);
+	assert_eq!(
+		points.len(),
+		4,
+		"never more than four checkpoints; the fifth marker is skipped, not exceeded"
+	);
+	assert!(
+		points.iter().all(|p| p.ttl.as_deref() == Some("1h")),
+		"kept checkpoints all carry the requested ttl"
+	);
+}

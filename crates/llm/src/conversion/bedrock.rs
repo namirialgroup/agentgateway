@@ -1655,6 +1655,7 @@ pub mod from_messages {
 						input_schema: Some(bedrock::ToolInputSchema::Json(tool.input_schema)),
 					}),
 					tool.cache_control.is_some(),
+					helpers::cache_control_ttl(tool.cache_control.as_ref()),
 				));
 			}
 
@@ -1712,9 +1713,10 @@ pub mod from_messages {
 							} => {
 								result.push(bedrock::SystemContentBlock::Text { text: text.clone() });
 								// Insert cache point if this block has cache_control
-								helpers::maybe_insert_cache_point(
+								helpers::maybe_insert_cache_point_with_ttl(
 									&mut result,
 									cache_control.is_some(),
+									helpers::cache_control_ttl(cache_control.as_ref()),
 									&mut cache_points_used,
 								);
 							},
@@ -1741,9 +1743,10 @@ pub mod from_messages {
 						{
 							let system_content = system_content.get_or_insert_with(Vec::new);
 							system_content.push(bedrock::SystemContentBlock::Text { text });
-							helpers::maybe_insert_cache_point(
+							helpers::maybe_insert_cache_point_with_ttl(
 								system_content,
 								cache_control.is_some(),
+								helpers::cache_control_ttl(cache_control.as_ref()),
 								&mut cache_points_used,
 							);
 						}
@@ -1755,6 +1758,20 @@ pub mod from_messages {
 			// Convert ContentBlocks from Anthropic → Bedrock, inserting cache points
 			let mut content = Vec::with_capacity(msg.content.len() * 2);
 			for block in msg.content {
+				// Outer-block client TTL rides the inserted cache point; markers
+				// on parts inside a tool_result extend `has_cache_control` but
+				// their per-part TTLs are not forwarded (outer marker wins).
+				let cache_ttl = match &block {
+					messages::ContentBlock::Text(b) => helpers::cache_control_ttl(b.cache_control.as_ref()),
+					messages::ContentBlock::Image(b) => helpers::cache_control_ttl(b.cache_control.as_ref()),
+					messages::ContentBlock::ToolUse { cache_control, .. } => {
+						helpers::cache_control_ttl(cache_control.as_ref())
+					},
+					messages::ContentBlock::ToolResult { cache_control, .. } => {
+						helpers::cache_control_ttl(cache_control.as_ref())
+					},
+					_ => None,
+				};
 				let (bedrock_block, has_cache_control) = match block {
 					messages::ContentBlock::Text(messages::ContentTextBlock {
 						text,
@@ -1886,7 +1903,12 @@ pub mod from_messages {
 
 				content.push(bedrock_block);
 
-				helpers::maybe_insert_cache_point(&mut content, has_cache_control, &mut cache_points_used);
+				helpers::maybe_insert_cache_point_with_ttl(
+					&mut content,
+					has_cache_control,
+					cache_ttl,
+					&mut cache_points_used,
+				);
 			}
 
 			messages.push(bedrock::Message { role, content });
@@ -1908,11 +1930,12 @@ pub mod from_messages {
 
 		let tool_config = pending_tool_config.map(|(tools, tool_choice)| {
 			let mut bedrock_tools = Vec::with_capacity(tools.len() * 2);
-			for (tool, has_cache_control) in tools {
+			for (tool, has_cache_control, tool_ttl) in tools {
 				bedrock_tools.push(tool);
-				helpers::maybe_insert_cache_point(
+				helpers::maybe_insert_cache_point_with_ttl(
 					&mut bedrock_tools,
 					has_cache_control,
+					tool_ttl,
 					&mut cache_points_used,
 				);
 			}
@@ -3777,6 +3800,20 @@ mod helpers {
 	pub fn create_cache_point() -> bedrock::CachePointBlock {
 		bedrock::CachePointBlock {
 			r#type: bedrock::CachePointType::Default,
+			ttl: None,
+		}
+	}
+
+	/// Client `cache_control.ttl` ("5m" / "1h") for a cache point, if the
+	/// marker requested one. Bedrock Converse defaults omitted TTLs to the
+	/// 5-minute class, so an explicit client TTL must ride the cache point
+	/// verbatim or a requested 1-hour checkpoint is silently downgraded.
+	pub fn cache_control_ttl(
+		cache_control: Option<&crate::types::messages::typed::CacheControlEphemeral>,
+	) -> Option<String> {
+		match cache_control {
+			Some(crate::types::messages::typed::CacheControlEphemeral::Ephemeral { ttl }) => ttl.clone(),
+			None => None,
 		}
 	}
 
@@ -3807,10 +3844,23 @@ mod helpers {
 		marked: bool,
 		cache_points_used: &mut usize,
 	) {
+		maybe_insert_cache_point_with_ttl(target, marked, None, cache_points_used);
+	}
+
+	/// Same as [`maybe_insert_cache_point`], carrying the client's requested
+	/// cache checkpoint TTL onto the inserted cache point.
+	pub fn maybe_insert_cache_point_with_ttl(
+		target: &mut impl CachePointTarget,
+		marked: bool,
+		ttl: Option<String>,
+		cache_points_used: &mut usize,
+	) {
 		if !marked || *cache_points_used >= 4 {
 			return;
 		}
-		target.push_cache_point(create_cache_point());
+		let mut cache_point = create_cache_point();
+		cache_point.ttl = ttl;
+		target.push_cache_point(cache_point);
 		*cache_points_used += 1;
 	}
 

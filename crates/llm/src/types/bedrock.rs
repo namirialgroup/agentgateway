@@ -279,6 +279,12 @@ pub enum Tool {
 pub struct CachePointBlock {
 	/// Specifies the type of cache point within the CachePointBlock.
 	pub r#type: CachePointType,
+	/// Cache checkpoint TTL ("5m" or "1h"). Bedrock Converse defaults to the
+	/// 5-minute class when omitted; the client's `cache_control.ttl` is
+	/// forwarded verbatim so a requested 1-hour checkpoint is not silently
+	/// downgraded to the default. Absent on cache points without a client TTL.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ttl: Option<String>,
 }
 
 #[derive(
