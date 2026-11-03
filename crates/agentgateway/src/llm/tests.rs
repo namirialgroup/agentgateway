@@ -4982,3 +4982,168 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 		ChatFormat::BedrockConverse
 	);
 }
+
+#[test]
+fn upstream_client_error_diagnostic_classifies_known_template() {
+	use super::upstream_client_error_diagnostic;
+	// The live-reproduced native Messages cache-marker validation body: the
+	// anchored template yields a stable class and digits-only parameters.
+	let a = upstream_client_error_diagnostic(
+		br#"{"type":"error","request_id":"r1","error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}"#,
+	);
+	let d = a.expect("anthropic envelope extracts");
+	assert_eq!(d.error_type, "invalid_request_error");
+	assert_eq!(d.class, Some("cache_marker_limit_exceeded"));
+	assert_eq!(d.params, "max=4,found=5");
+	// No free-form text field exists on the diagnostic at all.
+	assert!(!format!("{d:?}").contains("maximum of"));
+
+	// Second live-captured template (2026-11-03 stage rc3-cacheonly window):
+	// the ttl-ordering rejection arrives with the sentence wrapped in an inner
+	// JSON envelope inside error.message. Class-only, no parameters, and the
+	// wrapped sentence text never reaches any emitted field.
+	let b = upstream_client_error_diagnostic(
+		br#"{"type":"error","error":{"type":"invalid_request_error","message":"{\"message\":\"messages.0.content.1.cache_control.ttl: a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block. Note that blocks are processed in the following order: `tools`, `system`, `messages`.\"}"}}"#,
+	);
+	let d2 = b.expect("wrapped ttl-ordering envelope extracts");
+	assert_eq!(d2.error_type, "invalid_request_error");
+	assert_eq!(d2.class, Some("cache_ttl_ordering_violation"));
+	assert_eq!(d2.params, "-");
+	assert!(
+		!format!("{d2:?}").contains("cache_control block must not come after"),
+		"the raw sentence must not appear on the diagnostic: {:?}",
+		d2
+	);
+}
+
+#[test]
+fn upstream_client_error_diagnostic_never_emits_message_content() {
+	use super::upstream_client_error_diagnostic;
+	// The P0-E synthetic leak matrix: every payload class below must be
+	// absent from EVERY emitted field. Unclassifiable messages reduce to
+	// fingerprint + length, so containment holds by construction — these
+	// assertions pin it against regressions.
+	let secrets: [(&str, &str); 8] = [
+		(
+			"prompt excerpt",
+			"Confidential draft: the Q4 Meridian acquisition price is 43 million EUR",
+		),
+		("email", "jane.doe@example-corp.com"),
+		("aws account id", "707421298156"),
+		(
+			"arn",
+			"arn:aws:bedrock-mantle:us-east-1:123456789012:project/default",
+		),
+		("short api key", "sk-ant-api03-9fj20fjw0"),
+		("bearer token", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.tokenseg"),
+		(
+			"long secret 80 chars",
+			"Kx9mN2pQ7vR4wT8yZ3bC6fH1jL5nS0aD2gI4kM7oP3qU6rT9vWx2yZ5bC8fH1jL4n",
+		),
+		(
+			"nested json payload",
+			"{\"inner\":{\"deep\":\"vault-password-42\"}}",
+		),
+	];
+	for (label, payload) in secrets {
+		let body = json!({
+			"type": "error",
+			"error": {
+				"type": "invalid_request_error",
+				"message": format!("Validation failed near: {payload}"),
+			},
+		})
+		.to_string();
+		let d = upstream_client_error_diagnostic(body.as_bytes())
+			.unwrap_or_else(|| panic!("{label}: diagnostic should exist"));
+		assert_eq!(
+			d.class, None,
+			"{label}: 8-case matrix: must be unclassified"
+		);
+		assert_eq!(d.params, "-", "{label}: params must stay empty");
+		let emitted = format!(
+			"{} {} {} {} {}",
+			d.error_type,
+			d.class.unwrap_or("unclassified"),
+			d.params,
+			d.fingerprint,
+			d.message_bytes
+		);
+		assert!(
+			!emitted.contains(payload),
+			"{label}: payload leaked into diagnostic field: {emitted}"
+		);
+	}
+
+	// 20-char AWS access key id shape, also with surrounding message text.
+	let akia = "AKIAIOSFODNN7EXAMPLE";
+	let body2 = json!({
+		"__type": "ValidationException",
+		"message": format!("invalid credential {akia} supplied"),
+	})
+	.to_string();
+	let d2 = upstream_client_error_diagnostic(body2.as_bytes()).expect("aws envelope");
+	let emitted2 = format!(
+		"{} {} {} {} {}",
+		d2.error_type,
+		d2.class.unwrap_or("unclassified"),
+		d2.params,
+		d2.fingerprint,
+		d2.message_bytes
+	);
+	assert!(!emitted2.contains(akia), "access key leaked: {emitted2}");
+	assert!(
+		!emitted2.contains("invalid credential"),
+		"message text leaked"
+	);
+}
+
+#[test]
+fn upstream_client_error_diagnostic_shapes_and_edges() {
+	use super::upstream_client_error_diagnostic;
+	// AWS envelope shape extracts __type as the error class; unclassified
+	// message reduces to fingerprint + length.
+	let b = upstream_client_error_diagnostic(
+		br#"{"__type":"com.amazonaws.bedrock#ValidationException","message":"1 validation error detected: value at '/messages' failed"}"#,
+	);
+	let d = b.expect("aws envelope extracts");
+	assert_eq!(d.error_type, "com.amazonaws.bedrock#ValidationException");
+	assert_eq!(d.class, None);
+	assert_eq!(d.params, "-");
+	assert_eq!(d.fingerprint.len(), 16);
+	assert!(d.message_bytes > 0);
+
+	// Fingerprint is stable per message and distinct across messages.
+	let f1 = upstream_client_error_diagnostic(
+		br#"{"error":{"type":"invalid_request_error","message":"alpha"}}"#,
+	)
+	.unwrap()
+	.fingerprint;
+	let f1b = upstream_client_error_diagnostic(
+		br#"{"error":{"type":"invalid_request_error","message":"alpha"}}"#,
+	)
+	.unwrap()
+	.fingerprint;
+	let f2 = upstream_client_error_diagnostic(
+		br#"{"error":{"type":"invalid_request_error","message":"beta"}}"#,
+	)
+	.unwrap()
+	.fingerprint;
+	assert_eq!(f1, f1b, "same message → same fingerprint");
+	assert_ne!(f1, f2, "different message → different fingerprint");
+
+	// Hostile error_type values are charset-restricted and bounded.
+	let hostile = upstream_client_error_diagnostic(
+		br#"{"error":{"type":"x\"><script>alert(1)</script>AAAA","message":"m"}}"#,
+	)
+	.unwrap();
+	assert_eq!(hostile.error_type, "xscriptalert1scriptAAAA");
+
+	// Non-JSON body → no diagnostic (never log raw bytes).
+	assert!(upstream_client_error_diagnostic(b"<html>bad</html>").is_none());
+	// JSON without a recognizable error envelope → None.
+	assert!(
+		upstream_client_error_diagnostic(br#"{"ok":true}"#).is_none(),
+		"envelope without type/message yields nothing"
+	);
+}
