@@ -5173,46 +5173,112 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 	use crate::test_helpers::proxymock::setup_proxy_test;
 	use crate::types::agent::BackendTarget;
 
-	let provider = AIProvider::bedrock(bedrock::Provider {
-		model_override: Some(strng::new("global.anthropic.claude-opus-5-5")),
-		region: strng::new("eu-west-1"),
-		guardrail_identifier: None,
-		guardrail_version: None,
-		endpoint_preference: Default::default(),
-		transport: Default::default(),
-	});
-	let inputs = setup_proxy_test("{}").unwrap().pi;
-	let backend_info = BackendInfo {
-		target: BackendTarget::Invalid,
-		call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
-		inputs,
-	};
-	let req = ::http::Request::builder()
-		.uri("/v1/messages/count_tokens")
-		.header(::http::header::CONTENT_TYPE, "application/json")
-		.body(Body::from(
-			br#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
-		))
-		.unwrap();
+	async fn forwarded_model(provider: &AIProvider, backend_host: &str) -> (Value, RouteType) {
+		let inputs = setup_proxy_test("{}").unwrap().pi;
+		let backend_info = BackendInfo {
+			target: BackendTarget::Invalid,
+			call_target: Target::from((backend_host, 443)),
+			inputs,
+		};
+		let req = ::http::Request::builder()
+			.uri("/v1/messages/count_tokens")
+			.header(::http::header::CONTENT_TYPE, "application/json")
+			.body(Body::from(
+				br#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+			))
+			.unwrap();
+		let RequestResult::Success {
+			request: forwarded,
+			upstream_route_type,
+			..
+		} = provider
+			.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+			.await
+			.expect("mantle count_tokens request should process")
+		else {
+			panic!("expected forwarded request");
+		};
+		let forwarded_body = forwarded.collect().await.unwrap().to_bytes();
+		(
+			serde_json::from_slice(&forwarded_body).unwrap(),
+			upstream_route_type,
+		)
+	}
 
-	let RequestResult::Success {
-		request: forwarded,
-		upstream_route_type,
-		..
-	} = provider
-		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
-		.await
-		.expect("mantle count_tokens request should process")
-	else {
-		panic!("expected forwarded request");
-	};
+	// In-Region mantle (Sonnet 5 card lists eu-west-1): the body model is the
+	// base ID Mantle names, never the geo inference profile.
+	let no_approvals = CountTokensRegionsEnv::set("");
+	let in_region =
+		bedrock_provider_with_model_and_region("global.anthropic.claude-sonnet-5", "eu-west-1");
+	let (body, route) = forwarded_model(&in_region, "bedrock-runtime.eu-west-1.amazonaws.com").await;
+	assert_eq!(route, RouteType::AnthropicTokenCount);
+	assert_eq!(body["model"], json!("anthropic.claude-sonnet-5"));
+	assert_eq!(body["messages"][0]["content"], json!("hello"));
 
-	assert_eq!(upstream_route_type, RouteType::AnthropicTokenCount);
-	let forwarded_body = forwarded.collect().await.unwrap().to_bytes();
-	let forwarded_json: Value = serde_json::from_slice(&forwarded_body).unwrap();
-	// bedrock-mantle names base model IDs, never geo inference profiles.
-	assert_eq!(forwarded_json["model"], json!("anthropic.claude-opus-5-5"));
-	assert_eq!(forwarded_json["messages"][0]["content"], json!("hello"));
+	// Cross-Region mantle only with an explicit card-valid approval.
+	// (Drop the first guard first: the lock is not re-entrant.)
+	drop(no_approvals);
+	let _approved = CountTokensRegionsEnv::set("anthropic.claude-opus-5-5=us-east-1");
+	let cross_region =
+		bedrock_provider_with_model_and_region("global.anthropic.claude-opus-5-5", "eu-west-1");
+	let (body, _) = forwarded_model(&cross_region, "bedrock-runtime.eu-west-1.amazonaws.com").await;
+	assert_eq!(body["model"], json!("anthropic.claude-opus-5-5"));
+}
+
+#[tokio::test]
+async fn count_tokens_unsupported_models_are_rejected_before_dispatch() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	let _no_approvals = CountTokensRegionsEnv::set("");
+	for model_override in [
+		// Cross-Region-only card, no approval configured.
+		"global.anthropic.claude-opus-5-5",
+		// No commercial mantle Region at all (GovCloud-only cards).
+		"global.anthropic.claude-sonnet-5-5",
+		"global.anthropic.claude-haiku-5-5",
+	] {
+		let provider = bedrock_provider_with_model_and_region(model_override, "eu-west-1");
+		let inputs = setup_proxy_test("{}").unwrap().pi;
+		let backend_info = BackendInfo {
+			target: BackendTarget::Invalid,
+			call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
+			inputs,
+		};
+		let payload = br#"{"model":"alias","messages":[{"role":"user","content":"SECRET-PAYLOAD"}],"system":"SECRET-SYSTEM"}"#;
+		let req = ::http::Request::builder()
+			.uri("/v1/messages/count_tokens")
+			.header(::http::header::CONTENT_TYPE, "application/json")
+			.body(Body::from(payload.to_vec()))
+			.unwrap();
+		let RequestResult::Rejected(response) = provider
+			.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+			.await
+			.unwrap_or_else(|e| panic!("expected typed rejection for {model_override}: {e}"))
+		else {
+			panic!("expected rejection for {model_override}");
+		};
+		assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		let error: Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(error["type"], "error");
+		assert_eq!(error["error"]["type"], "invalid_request_error");
+		assert_eq!(
+			error["error"]["message"],
+			"Token counting is not supported for this model or request."
+		);
+		// Rejected BEFORE dispatch: the conversation payload is never echoed
+		// and no count (exact or estimated) is ever returned.
+		let text = String::from_utf8_lossy(&body);
+		for marker in ["SECRET-PAYLOAD", "SECRET-SYSTEM", "input_tokens"] {
+			assert!(
+				!text.contains(marker),
+				"model={model_override} leaked {marker}: {text}"
+			);
+		}
+		assert!(error.get("input_tokens").is_none());
+	}
 }
 
 #[tokio::test]
@@ -5340,22 +5406,33 @@ async fn anthropic_count_tokens_mantle_unavailable_and_malformed_never_fabricate
 	}
 }
 
-#[test]
 fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
-	// setup_request resolves the Bedrock endpoint per route type: the CRIS-only
-	// Claude 5.5 models ride the Anthropic-native count_tokens surface on
-	// bedrock-mantle, while non-Anthropic models keep the Runtime CountTokens
-	// API path.
+	// setup_request resolves the Bedrock endpoint per route type and model
+	// capability: mantle-capable models with a Region ride the Anthropic-native
+	// count_tokens surface; everything else keeps the Runtime CountTokens API
+	// path (unsupported models never reach setup — the gateway rejects them
+	// first).
+	let _no_approvals = CountTokensRegionsEnv::set("");
 	for (model, expected_path, expects_mantle) in [
 		(
-			"global.anthropic.claude-opus-5-5",
+			"global.anthropic.claude-sonnet-5",
 			"/anthropic/v1/messages/count_tokens",
 			true,
 		),
 		(
-			"global.anthropic.claude-sonnet-5-5",
+			"global.anthropic.claude-opus-4-8",
 			"/anthropic/v1/messages/count_tokens",
 			true,
+		),
+		(
+			"eu.anthropic.claude-sonnet-4-6",
+			"/model/eu.anthropic.claude-sonnet-4-6/count-tokens",
+			false,
+		),
+		(
+			"global.anthropic.claude-opus-5-5",
+			"/model/global.anthropic.claude-opus-5-5/count-tokens",
+			false,
 		),
 		(
 			"openai.gpt-6-luna",
@@ -5364,21 +5441,9 @@ fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
 		),
 	] {
 		let provider = bedrock_provider();
-		let llm_request = LLMRequest {
-			input_tokens: None,
-			input_format: InputFormat::CountTokens,
-			cache_convention: CacheTokenConvention::pending(),
-			request_model: model.into(),
-			provider: "aws.bedrock".into(),
-			streaming: false,
-			params: Default::default(),
-			prompt: None,
-			provider_state: None,
-			safeguards: None,
-			transport_hints: Default::default(),
-		};
+		let llm_request = count_tokens_llm_request(model);
 		let mut req = crate::http::tests_common::request(
-			"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
+			"https://bedrock-runtime.us-east-1.amazonaws.com/v1/messages/count_tokens",
 			http::Method::POST,
 			&[],
 		);
@@ -5401,34 +5466,12 @@ fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
 }
 
 #[test]
-fn count_tokens_bedrock_mantle_signing_region_follows_override() {
-	struct MantleRegionGuard;
-	impl Drop for MantleRegionGuard {
-		fn drop(&mut self) {
-			unsafe { std::env::remove_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION") };
-		}
-	}
-	unsafe { std::env::set_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION", "us-east-1") };
-	let _guard = MantleRegionGuard;
-
-	// Mantle endpoint (Claude model, count-tokens route): the SigV4 signing
-	// region follows the override — the provider itself lives in another
-	// Region, and bedrock-mantle only serves these models In-Region
-	// elsewhere (per model card).
+fn count_tokens_bedrock_mantle_signing_region_follows_the_resolution() {
+	// In-Region mantle: the host and the SigV4 signing Region are the
+	// provider's own Region.
+	let no_approvals = CountTokensRegionsEnv::set("");
 	let provider = bedrock_provider_with_region("eu-west-1");
-	let llm_request = LLMRequest {
-		input_tokens: None,
-		input_format: InputFormat::CountTokens,
-		cache_convention: CacheTokenConvention::pending(),
-		request_model: "global.anthropic.claude-opus-5-5".into(),
-		provider: "aws.bedrock".into(),
-		streaming: false,
-		params: Default::default(),
-		prompt: None,
-		provider_state: None,
-		safeguards: None,
-		transport_hints: Default::default(),
-	};
+	let llm_request = count_tokens_llm_request("global.anthropic.claude-sonnet-5");
 	let mut req = crate::http::tests_common::request(
 		"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
 		http::Method::POST,
@@ -5448,29 +5491,64 @@ fn count_tokens_bedrock_mantle_signing_region_follows_override() {
 		.expect("setup_request should succeed");
 	assert_eq!(req.uri().path(), "/anthropic/v1/messages/count_tokens");
 	assert_eq!(
+		req.uri().authority().map(|a| a.as_str()),
+		Some("bedrock-mantle.eu-west-1.api.aws")
+	);
+	assert_eq!(
+		req
+			.extensions()
+			.get::<bedrock::AwsRegion>()
+			.map(|region| region.region.as_str()),
+		Some("eu-west-1")
+	);
+
+	// Cross-Region mantle with an explicit card-valid approval: host and
+	// signing Region follow the approved destination.
+	drop(no_approvals);
+	let _approved = CountTokensRegionsEnv::set("anthropic.claude-opus-5-5=us-east-1");
+	let cross_request = count_tokens_llm_request("global.anthropic.claude-opus-5-5");
+	let mut req = crate::http::tests_common::request(
+		"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
+		http::Method::POST,
+		&[],
+	);
+	provider
+		.setup_request(
+			&mut req,
+			RouteType::AnthropicTokenCount,
+			Some(&cross_request),
+			None,
+			None,
+			false,
+			None,
+			None,
+		)
+		.expect("setup_request should succeed");
+	assert_eq!(
+		req.uri().authority().map(|a| a.as_str()),
+		Some("bedrock-mantle.us-east-1.api.aws")
+	);
+	assert_eq!(
 		req
 			.extensions()
 			.get::<bedrock::AwsRegion>()
 			.map(|region| region.region.as_str()),
 		Some("us-east-1")
 	);
+	drop(_approved);
 
-	// Runtime endpoint (non-Anthropic model): the signing region stays the
-	// provider's own Region, untouched by the mantle override.
+	// Runtime endpoint: the signing Region stays the provider's own.
 	let mut req = crate::http::tests_common::request(
 		"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
 		http::Method::POST,
 		&[],
 	);
-	let runtime_llm_request = LLMRequest {
-		request_model: "openai.gpt-6-luna".into(),
-		..llm_request
-	};
+	let runtime_request = count_tokens_llm_request("openai.gpt-6-luna");
 	provider
 		.setup_request(
 			&mut req,
 			RouteType::AnthropicTokenCount,
-			Some(&runtime_llm_request),
+			Some(&runtime_request),
 			None,
 			None,
 			false,
@@ -5491,6 +5569,55 @@ fn count_tokens_bedrock_mantle_signing_region_follows_override() {
 fn bedrock_provider_with_region(region: &str) -> AIProvider {
 	AIProvider::bedrock(bedrock::Provider {
 		model_override: None,
+		region: strng::new(region),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	})
+}
+
+/// Scoped, mutex-serialized guard for the count-tokens approvals env (same
+/// contract as the agent-llm guard: every env-touching test holds one).
+static COUNT_TOKENS_REGIONS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct CountTokensRegionsEnv(std::sync::MutexGuard<'static, ()>);
+
+impl CountTokensRegionsEnv {
+	fn set(value: &str) -> Self {
+		let lock = COUNT_TOKENS_REGIONS_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		unsafe { std::env::set_var("AGENTGATEWAY_BEDROCK_COUNT_TOKENS_REGIONS", value) };
+		Self(lock)
+	}
+}
+
+impl Drop for CountTokensRegionsEnv {
+	fn drop(&mut self) {
+		unsafe { std::env::remove_var("AGENTGATEWAY_BEDROCK_COUNT_TOKENS_REGIONS") };
+	}
+}
+
+fn count_tokens_llm_request(request_model: &str) -> LLMRequest {
+	LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::CountTokens,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: request_model.into(),
+		provider: "aws.bedrock".into(),
+		streaming: false,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
+	}
+}
+
+fn bedrock_provider_with_model_and_region(model: &str, region: &str) -> AIProvider {
+	AIProvider::bedrock(bedrock::Provider {
+		model_override: Some(strng::new(model)),
 		region: strng::new(region),
 		guardrail_identifier: None,
 		guardrail_version: None,

@@ -70,6 +70,19 @@ fn normalize_sse_response_headers(mut resp: Response) -> Response {
 	resp
 }
 
+/// The mantle count-tokens Region for a Bedrock provider and request model,
+/// when the model's capability + approvals resolve a mantle destination.
+fn count_tokens_mantle_region(
+	provider: &bedrock::Provider,
+	request_model: Option<&str>,
+) -> Option<String> {
+	let model = request_model?;
+	match provider.resolve_count_tokens(model) {
+		bedrock::CountTokensResolution::Mantle { region } => Some(region),
+		_ => None,
+	}
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AIBackend {
@@ -1338,7 +1351,13 @@ impl AIProvider {
 			)?;
 		}
 		if !has_host_override {
-			self.set_default_authority(req, route_type, connection_target, bedrock_endpoint)?;
+			self.set_default_authority(
+				req,
+				route_type,
+				connection_target,
+				bedrock_endpoint,
+				llm_request,
+			)?;
 		}
 		self.set_required_fields(req, route_type, llm_request, bedrock_endpoint)?;
 		Ok(())
@@ -1613,6 +1632,7 @@ impl AIProvider {
 		route_type: RouteType,
 		connection_target: Option<&mut Target>,
 		bedrock_endpoint: Option<bedrock::BedrockEndpoint>,
+		llm_request: Option<&LLMRequest>,
 	) -> anyhow::Result<()> {
 		let authority = match self {
 			AIProvider::OpenAI(_) => Authority::from_static(openai::DEFAULT_HOST_STR),
@@ -1624,7 +1644,20 @@ impl AIProvider {
 			AIProvider::Custom(_) => return Ok(()),
 			AIProvider::Bedrock(provider) => {
 				let endpoint = bedrock_endpoint.expect("setup_request resolves the Bedrock endpoint");
-				let host = provider.get_host(route_type, endpoint);
+				// The count-tokens mantle Region may be an approved cross-Region
+				// destination; every other mantle route uses the provider's own.
+				let host = match (route_type, endpoint) {
+					(RouteType::AnthropicTokenCount, bedrock::BedrockEndpoint::Mantle) => {
+						match count_tokens_mantle_region(
+							provider,
+							llm_request.map(|l| l.request_model.as_str()),
+						) {
+							Some(region) => provider.mantle_host(&region),
+							None => provider.get_host(route_type, endpoint),
+						}
+					},
+					_ => provider.get_host(route_type, endpoint),
+				};
 				// Bedrock's Mantle-vs-Runtime host is model-dependent, so align the connection target with it.
 				if let Some(Target::Hostname(target_host, _)) = connection_target {
 					*target_host = host.clone();
@@ -1746,10 +1779,15 @@ impl AIProvider {
 			},
 			AIProvider::Bedrock(provider) => http::modify_req(req, |req| {
 				// AWS signing needs the region on every Bedrock request, host override or not.
-				// The mantle endpoint signs with (and lives in) its own region,
-				// which may differ from the provider's Runtime region.
-				let signing_region = match bedrock_endpoint {
-					Some(bedrock::BedrockEndpoint::Mantle) => provider.mantle_region(),
+				// The mantle count-tokens Region may be an approved cross-Region
+				// destination (resolve_count_tokens — the data-residency gate);
+				// every other mantle route signs in the provider's own Region.
+				let signing_region = match (route_type, bedrock_endpoint) {
+					(RouteType::AnthropicTokenCount, Some(bedrock::BedrockEndpoint::Mantle)) => {
+						count_tokens_mantle_region(provider, llm_request.map(|l| l.request_model.as_str()))
+							.unwrap_or_else(|| provider.region.as_str().to_string())
+					},
+					(_, Some(bedrock::BedrockEndpoint::Mantle)) => provider.region.as_str().to_string(),
 					_ => provider.region.as_str().to_string(),
 				};
 				req.extensions.insert(bedrock::AwsRegion {
@@ -2203,7 +2241,7 @@ impl AIProvider {
 			return Ok(RequestResult::Rejected(resp));
 		}
 
-		self
+		let result = self
 			.process_non_chat_request(
 				backend_info,
 				policies,
@@ -2217,7 +2255,33 @@ impl AIProvider {
 					provider.render_count_tokens_request(req, &parts.headers, request_model, catalog)
 				},
 			)
-			.await
+			.await?;
+		// Bedrock capability gate (AWS model cards): CRIS-only Claude launches
+		// have no Runtime CountTokens surface, and some (the 5.5 family) have
+		// no commercial bedrock-mantle Region at all. Reject before dispatch
+		// when no supported surface exists in an approved Region — the payload
+		// never leaves the gateway and no estimate is ever returned.
+		if let (RequestResult::Success { llm_request, .. }, AIProvider::Bedrock(p)) = (&result, self) {
+			if matches!(
+				p.resolve_count_tokens(llm_request.request_model.as_str()),
+				bedrock::CountTokensResolution::Unsupported
+			) {
+				let body = serde_json::json!({
+					"type": "error",
+					"error": {
+						"type": "invalid_request_error",
+						"message": "Token counting is not supported for this model or request."
+					}
+				});
+				let resp = ::http::Response::builder()
+					.status(::http::StatusCode::BAD_REQUEST)
+					.header(::http::header::CONTENT_TYPE, "application/json")
+					.body(Body::from(body.to_string()))
+					.expect("failed to build count_tokens error response");
+				return Ok(RequestResult::Rejected(resp));
+			}
+		}
+		Ok(result)
 	}
 
 	pub async fn process_gemini_count_tokens_request(

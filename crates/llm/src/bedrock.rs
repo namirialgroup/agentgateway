@@ -54,13 +54,82 @@ pub enum BedrockEndpoint {
 // Mantle signs SigV4 under this name instead of the default "bedrock".
 const MANTLE_SIGNING_SERVICE_NAME: &str = "bedrock-mantle";
 
-/// Environment override for the bedrock-mantle endpoint Region (host AND SigV4
-/// signing region). bedrock-mantle serves Claude models In-Region in a small
-/// set of Regions that differs per model (model cards; e.g. Opus 5.5:
-/// us-east-1 / ap-southeast-4, Sonnet 5.5: none commercial at card time), so a
-/// gateway running elsewhere (our eu-west-1) must call a supported Region.
-/// Read per call (not cached) so tests and rolling config stay independent.
-const MANTLE_REGION_ENV: &str = "AGENTGATEWAY_BEDROCK_MANTLE_REGION";
+/// Operator-approved cross-Region count_tokens destinations, as
+/// comma-separated `base-model-id=region` entries (e.g.
+/// `anthropic.claude-opus-5-5=us-east-1`). A card-listed Region is necessary
+/// but NOT sufficient: count_tokens carries the full conversation payload,
+/// so leaving the provider's Region requires this explicit per-model
+/// authorization. Read per call (not cached) so tests and rolling config stay
+/// independent.
+const COUNT_TOKENS_APPROVED_REGIONS_ENV: &str = "AGENTGATEWAY_BEDROCK_COUNT_TOKENS_REGIONS";
+
+/// CountTokens capability per Anthropic base model ID, from the AWS model
+/// cards (verified 2026-11-03). Models absent from the table use the Runtime
+/// CountTokens API surface (the historic resolution) — correct for Sonnet 4.6
+/// and Haiku 4.5 and conservative for models whose cards were not verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountTokensSurface {
+	/// The Runtime CountTokens API serves this model (geo/global profiles).
+	Runtime,
+	/// bedrock-runtime CountTokens is denied for this model (CRIS-only
+	/// launch); bedrock-mantle serves Anthropic-native count_tokens in
+	/// exactly these commercial Regions (GovCloud partitions excluded — a
+	/// commercial account cannot treat them as availability).
+	Mantle { regions: &'static [&'static str] },
+}
+
+pub fn count_tokens_surface(base_model: &str) -> CountTokensSurface {
+	match base_model {
+		"anthropic.claude-opus-5-5" => CountTokensSurface::Mantle {
+			regions: &["us-east-1", "ap-southeast-4"],
+		},
+		"anthropic.claude-sonnet-5-5" => CountTokensSurface::Mantle { regions: &[] },
+		"anthropic.claude-haiku-5-5" => CountTokensSurface::Mantle { regions: &[] },
+		"anthropic.claude-opus-4-8" => CountTokensSurface::Mantle {
+			regions: &[
+				"us-east-1",
+				"eu-north-1",
+				"eu-west-1",
+				"ap-northeast-1",
+				"ap-southeast-4",
+			],
+		},
+		"anthropic.claude-sonnet-5" => CountTokensSurface::Mantle {
+			regions: &["us-east-1", "eu-north-1", "eu-west-1", "ap-southeast-4"],
+		},
+		"anthropic.claude-opus-5" => CountTokensSurface::Mantle {
+			regions: &["us-east-1", "eu-north-1", "eu-west-1", "ap-southeast-4"],
+		},
+		"anthropic.claude-fable-5" => CountTokensSurface::Mantle {
+			regions: &["us-east-1"],
+		},
+		_ => CountTokensSurface::Runtime,
+	}
+}
+
+/// Strip a cross-Region inference-profile prefix (`global.`/`eu.`/`us.`/…) to
+/// the base model ID bedrock-mantle names; bare IDs pass through unchanged.
+pub fn base_model_id(request_model: &str) -> &str {
+	match request_model.split_once('.') {
+		Some((_, base)) if base.starts_with("anthropic.") => base,
+		_ => request_model,
+	}
+}
+
+/// The resolved count_tokens destination for one request model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CountTokensResolution {
+	/// Runtime CountTokens API (works only once `bedrock:CountTokens` is
+	/// granted; models whose cards list Count tokens as supported there).
+	Runtime,
+	/// Anthropic-native count_tokens on bedrock-mantle in this Region
+	/// (in-Region when the Region matches the card, or an explicitly approved
+	/// cross-Region destination).
+	Mantle { region: String },
+	/// No supported surface in an approved Region: reject before dispatch —
+	/// never send the payload to AWS, never return an estimate.
+	Unsupported,
+}
 
 #[apply(schema!)]
 #[cfg_attr(feature = "schema", schemars(rename = "BedrockProviderConfig"))]
@@ -110,28 +179,59 @@ impl Provider {
 			},
 			RT::Models => BedrockEndpoint::Mantle,
 			RT::Detect | RT::Passthrough | RT::GenerateContent => BedrockEndpoint::Runtime,
-			// Claude models that launch CRIS-only on bedrock-runtime (geo-prefixed
-			// inference profiles such as global.anthropic.claude-*-5-5) have no
-			// Region-specific CountTokens surface there — the Runtime CountTokens
-			// API denies them (AWS model cards). bedrock-mantle serves Anthropic's
-			// native count_tokens for every Claude model, so Anthropic count-tokens
-			// routes there regardless of the CHAT transport (NativeMessages forces
-			// Runtime for chat only; count-tokens is transport-independent). An
-			// explicit RuntimeOnly pin stays honored.
+			// count_tokens is model-capability-routed, NOT blanket-routed: only
+			// models whose cards deny Runtime CountTokens AND have an approved
+			// mantle Region resolve here (see resolve_count_tokens). The gateway
+			// rejects `Unsupported` models before dispatch, so this arm is only
+			// reached for dispatchable requests. Chat keeps its own resolution.
 			RT::AnthropicTokenCount
-				if model_id.is_some_and(|m| self.is_anthropic_model(m))
-					&& !matches!(
-						self.endpoint_preference,
-						BedrockEndpointPreference::RuntimeOnly
-					) =>
+				if model_id.is_some_and(|m| {
+					matches!(
+						self.resolve_count_tokens(m),
+						CountTokensResolution::Mantle { .. }
+					)
+				}) =>
 			{
 				BedrockEndpoint::Mantle
 			},
-			// Chat (and Anthropic count-tokens under an explicit RuntimeOnly pin)
-			// follows the model's endpoint: Runtime's Converse / CountTokens APIs,
-			// or Mantle's native OpenAI/Anthropic APIs.
+			// Chat and Runtime-capable count-tokens follow the model's endpoint:
+			// Runtime's Converse / CountTokens APIs, or Mantle's native
+			// OpenAI/Anthropic APIs.
 			RT::Completions | RT::Messages | RT::Responses | RT::AnthropicTokenCount => {
 				self.chat_endpoint(model_id, catalog)
+			},
+		}
+	}
+
+	/// Resolve the count_tokens destination for a request model (geo profile
+	/// or base ID). In-Region mantle needs no approval; any cross-Region
+	/// destination requires an explicit per-model operator approval in
+	/// `AGENTGATEWAY_BEDROCK_COUNT_TOKENS_REGIONS` — the data-residency gate,
+	/// because count_tokens ships the full conversation payload.
+	pub fn resolve_count_tokens(&self, request_model: &str) -> CountTokensResolution {
+		match count_tokens_surface(base_model_id(request_model)) {
+			CountTokensSurface::Runtime => CountTokensResolution::Runtime,
+			CountTokensSurface::Mantle { regions } => {
+				// An explicit RuntimeOnly pin cannot reach the mantle surface.
+				if matches!(
+					self.endpoint_preference,
+					BedrockEndpointPreference::RuntimeOnly
+				) {
+					return CountTokensResolution::Unsupported;
+				}
+				// In-Region first: no residency question, no approval needed.
+				if regions.contains(&self.region.as_str()) {
+					return CountTokensResolution::Mantle {
+						region: self.region.as_str().to_string(),
+					};
+				}
+				// Cross-Region only with an explicit, card-valid approval.
+				if let Some(approved) = approved_count_tokens_region(base_model_id(request_model)) {
+					if regions.contains(&approved.as_str()) {
+						return CountTokensResolution::Mantle { region: approved };
+					}
+				}
+				CountTokensResolution::Unsupported
 			},
 		}
 	}
@@ -275,11 +375,12 @@ impl Provider {
 	/// `AGENTGATEWAY_BEDROCK_MANTLE_REGION` override when set, else the
 	/// provider's own Region. Used for the mantle host and its SigV4 signing
 	/// region.
-	pub fn mantle_region(&self) -> String {
-		std::env::var(MANTLE_REGION_ENV)
-			.ok()
-			.filter(|r| !r.is_empty())
-			.unwrap_or_else(|| self.region.as_str().to_owned())
+	/// The bedrock-mantle host for a Region. Count-tokens callers pass the
+	/// Region from `resolve_count_tokens` (which may be an approved
+	/// cross-Region destination); every other mantle route uses the
+	/// provider's own Region.
+	pub fn mantle_host(&self, region: &str) -> Strng {
+		strng::format!("bedrock-mantle.{}.api.aws", region)
 	}
 
 	pub fn get_host(&self, route_type: super::RouteType, endpoint: BedrockEndpoint) -> Strng {
@@ -288,14 +389,25 @@ impl Provider {
 			return strng::format!("bedrock-agent-runtime.{}.amazonaws.com", self.region);
 		}
 		match endpoint {
-			BedrockEndpoint::Mantle => {
-				strng::format!("bedrock-mantle.{}.api.aws", self.mantle_region())
-			},
+			BedrockEndpoint::Mantle => self.mantle_host(self.region.as_str()),
 			BedrockEndpoint::Runtime => {
 				strng::format!("bedrock-runtime.{}.amazonaws.com", self.region)
 			},
 		}
 	}
+}
+
+/// The operator-approved cross-Region count_tokens destination for a base
+/// model ID, if any (see `COUNT_TOKENS_APPROVED_REGIONS_ENV`). Returns the
+/// region string as configured; card validity is checked by the caller.
+fn approved_count_tokens_region(base_model: &str) -> Option<String> {
+	let approvals = std::env::var(COUNT_TOKENS_APPROVED_REGIONS_ENV).ok()?;
+	approvals
+		.split(',')
+		.filter_map(|entry| entry.split_once('='))
+		.find(|(model, _)| model.trim() == base_model)
+		.map(|(_, region)| region.trim().to_string())
+		.filter(|region| !region.is_empty())
 }
 
 #[cfg(test)]
@@ -320,80 +432,172 @@ mod tests {
 		p
 	}
 
-	/// Scoped test guard for `AGENTGATEWAY_BEDROCK_MANTLE_REGION`: sets the
-	/// override and removes it on drop, so parallel tests observe the default
-	/// again as soon as the guarded test ends.
-	struct MantleRegionOverrideGuard;
+	/// Scoped guard for `AGENTGATEWAY_BEDROCK_COUNT_TOKENS_REGIONS`: sets the
+	/// approvals under a shared mutex (parallel tests mutate this env, so
+	/// every env-touching test must hold the guard for its whole body) and
+	/// removes them on drop.
+	static COUNT_TOKENS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-	impl MantleRegionOverrideGuard {
-		fn set(region: &str) -> Self {
-			// Same single-test scoped pattern as the tool-search env guard:
-			// the override lives only for the duration of this test.
-			unsafe { std::env::set_var(MANTLE_REGION_ENV, region) };
-			Self
+	struct CountTokensRegionsGuard(std::sync::MutexGuard<'static, ()>);
+
+	impl CountTokensRegionsGuard {
+		fn set(value: &str) -> Self {
+			let lock = COUNT_TOKENS_ENV_LOCK
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+			unsafe { std::env::set_var(COUNT_TOKENS_APPROVED_REGIONS_ENV, value) };
+			Self(lock)
 		}
 	}
 
-	impl Drop for MantleRegionOverrideGuard {
+	impl Drop for CountTokensRegionsGuard {
 		fn drop(&mut self) {
-			unsafe { std::env::remove_var(MANTLE_REGION_ENV) };
+			unsafe { std::env::remove_var(COUNT_TOKENS_APPROVED_REGIONS_ENV) };
 		}
 	}
 
-	#[test]
-	fn resolve_endpoint_explicit_preferences_ignore_model_table() {
-		let mantle = provider(BedrockEndpointPreference::MantleOnly);
-		let runtime = provider(BedrockEndpointPreference::RuntimeOnly);
-		assert_eq!(
-			mantle.resolve_endpoint(RouteType::Messages, Some("any-model"), None),
-			BedrockEndpoint::Mantle
-		);
-		assert_eq!(
-			runtime.resolve_endpoint(RouteType::Messages, Some("any-model"), None),
-			BedrockEndpoint::Runtime
-		);
+	fn provider_in(region: &str) -> Provider {
+		let mut p = provider(BedrockEndpointPreference::RuntimePreferred);
+		p.region = strng::new(region);
+		p
 	}
 
 	#[test]
-	fn resolve_endpoint_runtime_preferred_routes_non_chat_by_route_type() {
-		// These routes resolve by route type alone (no catalog lookup), so this is deterministic.
-		let p = provider(BedrockEndpointPreference::RuntimePreferred);
-		assert_eq!(
-			p.resolve_endpoint(RouteType::Embeddings, None, None),
-			BedrockEndpoint::Runtime
-		);
-		assert_eq!(
-			p.resolve_endpoint(RouteType::Rerank, None, None),
-			BedrockEndpoint::Runtime
-		);
-		assert_eq!(
-			p.resolve_endpoint(RouteType::Models, None, None),
-			BedrockEndpoint::Mantle
-		);
-	}
-
-	#[test]
-	fn resolve_endpoint_routes_anthropic_count_tokens_to_mantle() {
-		// CRIS-only Claude models (geo inference profiles) have no CountTokens
-		// surface on bedrock-runtime; the Anthropic-native count_tokens API on
-		// bedrock-mantle is the documented surface for them.
-		let p = provider(BedrockEndpointPreference::RuntimePreferred);
+	fn count_tokens_resolution_follows_the_model_cards() {
+		// Card-verified capabilities (2026-11-03), provider in eu-west-1,
+		// no cross-Region approvals configured (pinned explicitly so a
+		// parallel test's approvals cannot leak in).
+		let _no_approvals = CountTokensRegionsGuard::set("");
+		let eu = provider_in("eu-west-1");
+		// Runtime-capable models keep the Runtime CountTokens API.
 		for model in [
-			"global.anthropic.claude-opus-5-5",
-			"global.anthropic.claude-sonnet-5-5",
 			"eu.anthropic.claude-sonnet-4-6",
-			"us.anthropic.claude-haiku-4-5-20251001-v1:0",
+			"global.anthropic.claude-sonnet-4-6",
+			"eu.anthropic.claude-haiku-4-5-20251001-v1:0",
 			"anthropic.claude-3-5-sonnet-20241022-v2:0",
 		] {
 			assert_eq!(
-				p.resolve_endpoint(RouteType::AnthropicTokenCount, Some(model), None),
-				BedrockEndpoint::Mantle,
+				eu.resolve_count_tokens(model),
+				CountTokensResolution::Runtime,
+				"model={model}"
+			);
+		}
+		// Mantle-capable in eu-west-1: in-Region, no approval needed.
+		for model in [
+			"global.anthropic.claude-opus-4-8",
+			"global.anthropic.claude-sonnet-5",
+			"global.anthropic.claude-opus-5",
+		] {
+			assert_eq!(
+				eu.resolve_count_tokens(model),
+				CountTokensResolution::Mantle {
+					region: "eu-west-1".to_string()
+				},
+				"model={model}"
+			);
+		}
+		// Opus 5.5 has no eu-west-1 mantle: cross-Region-only, so without an
+		// explicit approval it is unsupported — no default Global-to-US path.
+		assert_eq!(
+			eu.resolve_count_tokens("global.anthropic.claude-opus-5-5"),
+			CountTokensResolution::Unsupported
+		);
+		// Sonnet/Haiku 5.5 have NO commercial mantle Region at all.
+		for model in [
+			"global.anthropic.claude-sonnet-5-5",
+			"global.anthropic.claude-haiku-5-5",
+		] {
+			assert_eq!(
+				eu.resolve_count_tokens(model),
+				CountTokensResolution::Unsupported,
+				"model={model}"
+			);
+		}
+		// In the model's own mantle Region the same model resolves in-Region.
+		assert_eq!(
+			provider_in("us-east-1").resolve_count_tokens("global.anthropic.claude-opus-5-5"),
+			CountTokensResolution::Mantle {
+				region: "us-east-1".to_string()
+			}
+		);
+	}
+
+	#[test]
+	fn count_tokens_cross_region_requires_explicit_card_valid_approval() {
+		let _guard = CountTokensRegionsGuard::set(
+			"anthropic.claude-opus-5-5=us-east-1,anthropic.claude-sonnet-5-5=us-east-1",
+		);
+		let eu = provider_in("eu-west-1");
+		// Approved AND card-listed: allowed.
+		assert_eq!(
+			eu.resolve_count_tokens("global.anthropic.claude-opus-5-5"),
+			CountTokensResolution::Mantle {
+				region: "us-east-1".to_string()
+			}
+		);
+		// Approved but NOT card-listed for the model: still unsupported — a
+		// GovCloud-only model cannot be willed into a commercial Region, and
+		// one model's approval never opens another's destination.
+		assert_eq!(
+			eu.resolve_count_tokens("global.anthropic.claude-sonnet-5-5"),
+			CountTokensResolution::Unsupported
+		);
+		drop(_guard);
+		// An approval naming a Region the card does not list is ignored.
+		let _bad = CountTokensRegionsGuard::set("anthropic.claude-opus-5-5=eu-west-1");
+		assert_eq!(
+			eu.resolve_count_tokens("global.anthropic.claude-opus-5-5"),
+			CountTokensResolution::Unsupported
+		);
+	}
+
+	#[test]
+	fn count_tokens_runtime_only_pin_on_mantle_model_is_unsupported() {
+		let _no_approvals = CountTokensRegionsGuard::set("");
+		let mut pinned = provider_in("us-east-1");
+		pinned.endpoint_preference = BedrockEndpointPreference::RuntimeOnly;
+		assert_eq!(
+			pinned.resolve_count_tokens("global.anthropic.claude-opus-5-5"),
+			CountTokensResolution::Unsupported
+		);
+		// Runtime-capable models are unaffected by the pin (Runtime is their
+		// surface anyway).
+		assert_eq!(
+			pinned.resolve_count_tokens("eu.anthropic.claude-sonnet-4-6"),
+			CountTokensResolution::Runtime
+		);
+	}
+
+	#[test]
+	fn count_tokens_endpoint_resolution_matches_the_resolution() {
+		let _no_approvals = CountTokensRegionsGuard::set("");
+		let eu = provider_in("eu-west-1");
+		// Mantle-capable in-Region models resolve the mantle endpoint…
+		assert_eq!(
+			eu.resolve_endpoint(
+				RouteType::AnthropicTokenCount,
+				Some("global.anthropic.claude-sonnet-5"),
+				None
+			),
+			BedrockEndpoint::Mantle
+		);
+		// …Runtime-capable and unsupported models keep the Runtime path (the
+		// gateway rejects the unsupported ones before dispatch).
+		for model in [
+			"eu.anthropic.claude-sonnet-4-6",
+			"global.anthropic.claude-opus-5-5",
+			"global.anthropic.claude-sonnet-5-5",
+		] {
+			assert_eq!(
+				eu.resolve_endpoint(RouteType::AnthropicTokenCount, Some(model), None),
+				BedrockEndpoint::Runtime,
 				"model={model}"
 			);
 		}
 		// Count-tokens rides Mantle even when the chat transport is native:
 		// the transport selector forces Runtime for chat only.
-		let native = native_provider(BedrockEndpointPreference::RuntimePreferred);
+		let mut native = provider_in("us-east-1");
+		native.transport = BedrockTransport::NativeMessages;
 		assert_eq!(
 			native.resolve_endpoint(
 				RouteType::AnthropicTokenCount,
@@ -410,17 +614,9 @@ mod tests {
 			),
 			BedrockEndpoint::Runtime
 		);
-		// Chat and non-Anthropic count-tokens keep their current resolution.
+		// Non-Anthropic models keep the Runtime CountTokens API.
 		assert_eq!(
-			p.resolve_endpoint(
-				RouteType::Messages,
-				Some("global.anthropic.claude-opus-5-5"),
-				None
-			),
-			BedrockEndpoint::Runtime
-		);
-		assert_eq!(
-			p.resolve_endpoint(
+			eu.resolve_endpoint(
 				RouteType::AnthropicTokenCount,
 				Some("openai.gpt-6-luna"),
 				None
@@ -430,38 +626,19 @@ mod tests {
 	}
 
 	#[test]
-	fn mantle_host_and_signing_region_follow_override() {
-		let p = provider(BedrockEndpointPreference::RuntimePreferred);
-		// Default: the mantle host lives in the provider's own region…
+	fn mantle_host_uses_the_resolved_region() {
+		let p = provider_in("us-east-1");
+		assert_eq!(
+			p.mantle_host("eu-west-1"),
+			"bedrock-mantle.eu-west-1.api.aws"
+		);
 		assert_eq!(
 			p.get_host(RouteType::Messages, BedrockEndpoint::Mantle),
 			"bedrock-mantle.us-east-1.api.aws"
 		);
-		// …unless the mantle region override points at a region that
-		// actually serves the model In-Region (per-model card). The
-		// override drives the host AND the SigV4 signing region (see
-		// setup_request); the Runtime host never follows it.
-		let _guard = MantleRegionOverrideGuard::set("eu-west-1");
-		assert_eq!(
-			p.get_host(RouteType::Messages, BedrockEndpoint::Mantle),
-			"bedrock-mantle.eu-west-1.api.aws"
-		);
 		assert_eq!(
 			p.get_host(RouteType::Messages, BedrockEndpoint::Runtime),
 			"bedrock-runtime.us-east-1.amazonaws.com"
-		);
-	}
-
-	#[test]
-	fn resolve_endpoint_runtime_only_pin_keeps_runtime_count_tokens() {
-		let p = provider(BedrockEndpointPreference::RuntimeOnly);
-		assert_eq!(
-			p.resolve_endpoint(
-				RouteType::AnthropicTokenCount,
-				Some("global.anthropic.claude-opus-5-5"),
-				None
-			),
-			BedrockEndpoint::Runtime
 		);
 	}
 

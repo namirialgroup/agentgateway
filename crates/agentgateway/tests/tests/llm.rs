@@ -2150,3 +2150,70 @@ impl ratelimitmock::Handler for RecordingRateLimit {
 		ratelimitmock::ok_response()
 	}
 }
+
+#[tokio::test]
+async fn llm_count_tokens_upstream_timeout_is_sanitized_and_never_a_count() {
+	use std::time::Duration;
+
+	// Real transport timeout (not an upstream 503): the mock never answers
+	// within the route's request timeout, so the gateway's own timeout fires.
+	let mock = MockServer::start().await;
+	Mock::given(wiremock::matchers::path_regex("/.*"))
+		.respond_with(ResponseTemplate::new(StatusCode::OK.as_u16()).set_delay(Duration::from_secs(30)))
+		.mount(&mock)
+		.await;
+	let backend_name = "custom-ai";
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_bind(simple_bind())
+		.with_raw_backend(custom_llm_backend_with_formats(
+			backend_name,
+			SimpleBackendReference::InlineBackend(Target::Address(*mock.address())),
+			vec![custom::ProviderFormatConfig {
+				format: custom::ProviderFormat::AnthropicTokenCount,
+				path: None,
+			}],
+		));
+	let mut route = basic_named_route(strng::format!("/{backend_name}"));
+	route
+		.inline_policies
+		.push(TrafficPolicy::AI(Arc::new(agentgateway::llm::Policy {
+			routes: [(
+				strng::new("/v1/messages/count_tokens"),
+				agentgateway::llm::RouteType::AnthropicTokenCount,
+			)]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		})));
+	route.inline_policies.push(TrafficPolicy::Timeout(
+		agentgateway::http::timeout::Policy {
+			request_timeout: Some(Duration::from_millis(300)),
+			..Default::default()
+		},
+	));
+	let t = t.with_route(route);
+	let io = t.serve_http(BIND_KEY);
+
+	let res = RequestBuilder::new(Method::POST, "http://lo/custom-ai/v1/messages/count_tokens")
+		.header("content-type", "application/json")
+		.body(Body::from(
+			br#"{"model":"replaceme","messages":[{"role":"user","content":"SECRET-TIMEOUT-PAYLOAD"}]}"#
+				.to_vec(),
+		))
+		.send(io.clone())
+		.await
+		.expect("count_tokens request should be answered by the timeout");
+	assert_eq!(
+		res.status(),
+		StatusCode::GATEWAY_TIMEOUT,
+		"a transport timeout must surface as a gateway timeout"
+	);
+	let body = read_body_raw(res.into_body()).await;
+	// A timed-out count is never a count, and the payload never echoes. The
+	// body may be empty or a sanitized envelope — either is acceptable as
+	// long as it carries no fabricated count and no payload echo.
+	let text = String::from_utf8_lossy(&body);
+	assert!(!text.contains("SECRET-TIMEOUT-PAYLOAD"), "leaked: {text}");
+	assert!(!text.contains("input_tokens"), "fabricated a count: {text}");
+}
