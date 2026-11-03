@@ -1048,6 +1048,45 @@ pub(crate) fn encode_deferred_response(resp: &mut Response) {
 	resp.headers_mut().remove(header::TRANSFER_ENCODING);
 }
 
+/// Sanitizes a bedrock-mantle count_tokens error (Anthropic error envelope)
+/// to the client-facing contract: keep the typed error class for 4xx with a
+/// generic message, map a denied project (403) to a generic 502 with no AWS
+/// internals, and keep 5xx transient. No request ids, no ARNs, no provider
+/// validation detail, and never a count.
+fn sanitize_mantle_count_tokens_error(
+	status: ::http::StatusCode,
+	bytes: &bytes::Bytes,
+) -> (::http::StatusCode, bytes::Bytes) {
+	use ::http::StatusCode as SC;
+	let envelope = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+	let error_type = envelope
+		.as_ref()
+		.and_then(|v| v.pointer("/error/type"))
+		.and_then(serde_json::Value::as_str)
+		.map(strng::new);
+	let generic = |status: SC, error_type: Option<Strng>| {
+		let error_type = error_type.unwrap_or_else(|| strng::literal!("api_error"));
+		let body = serde_json::json!({
+			"type": "error",
+			"error": {
+				"type": error_type,
+				"message": "Token counting failed for this request.",
+			}
+		});
+		(status, bytes::Bytes::from(body.to_string()))
+	};
+	match status {
+		// Denied project authorization (bedrock-mantle:CountTokens on the
+		// project ARN): upstream unavailable, zero internal detail.
+		SC::FORBIDDEN | SC::UNAUTHORIZED => generic(SC::BAD_GATEWAY, None),
+		// Typed client error (unsupported beta/field, invalid shape): keep
+		// the class, replace the message.
+		s if s.is_client_error() => generic(s, error_type),
+		// Transient upstream failure stays transient.
+		_ => generic(SC::SERVICE_UNAVAILABLE, None),
+	}
+}
+
 impl AIProvider {
 	pub fn provider(&self) -> Strng {
 		match self {
@@ -1222,6 +1261,23 @@ impl AIProvider {
 
 	pub fn supports_format(&self, format: custom::ProviderFormat, request_model: &str) -> bool {
 		self.supported_formats(request_model).contains(&format)
+	}
+
+	/// Whether this model has NO legal Anthropic count-tokens surface from
+	/// this provider (capability resolution `Unsupported`: Runtime denied and
+	/// no in-Region bedrock-mantle availability). Such a request must fail
+	/// closed with the typed client-contract error BEFORE any AWS invocation —
+	/// the count_tokens body is enterprise prompt content and must never reach
+	/// a Region that cannot serve the model (R10), and exact counts must never
+	/// be fabricated. All non-Bedrock providers are unaffected.
+	fn count_tokens_unsupported(&self, request_model: &str) -> bool {
+		match self {
+			AIProvider::Bedrock(provider) => {
+				bedrock::resolve_count_tokens(request_model, provider.region.as_str())
+					== bedrock::CountTokensSurface::Unsupported
+			},
+			_ => false,
+		}
 	}
 
 	fn non_chat_provider_format_for(
@@ -1755,8 +1811,14 @@ impl AIProvider {
 			},
 			AIProvider::Bedrock(provider) => http::modify_req(req, |req| {
 				// AWS signing needs the region on every Bedrock request, host override or not.
+				// The mantle endpoint signs with (and lives in) its own region,
+				// which may differ from the provider's Runtime region.
+				let signing_region = match bedrock_endpoint {
+					Some(bedrock::BedrockEndpoint::Mantle) => provider.mantle_region(),
+					_ => provider.region.as_str().to_string(),
+				};
 				req.extensions.insert(bedrock::AwsRegion {
-					region: provider.region.as_str().to_string(),
+					region: signing_region,
 				});
 				// Mantle signs under a different service name; set it here so it survives a host override.
 				if let Some(service) =
@@ -2177,28 +2239,29 @@ impl AIProvider {
 
 		// Some Anthropic-compatible clients (e.g. Claude Code) always call
 		// `/v1/messages/count_tokens`. For providers/models without a native
-		// count-tokens endpoint, we must still answer this route, so we fall
-		// back to local token estimation using the normalized messages payload.
-		let use_local = !self.supports_format(
-			custom::ProviderFormat::AnthropicTokenCount,
-			req
-				.model
-				.as_deref()
-				.ok_or_else(|| AIError::MissingField("model not specified".into()))?,
-		);
+		// count-tokens endpoint, fail explicitly instead of presenting a local
+		// estimate as an exact provider token count.
+		let request_model = req
+			.model
+			.as_deref()
+			.ok_or_else(|| AIError::MissingField("model not specified".into()))?
+			.to_string();
+		let use_local = !self
+			.supports_format(custom::ProviderFormat::AnthropicTokenCount, &request_model)
+			|| self.count_tokens_unsupported(&request_model);
 		if use_local {
-			let messages = req.get_messages();
-			let model = req.model.as_deref().unwrap_or_default();
-			let count = num_tokens_from_messages(model, &messages)?;
-			let body = serde_json::to_vec(&types::count_tokens::Response {
-				input_tokens: count,
-			})
-			.map_err(AIError::ResponseMarshal)?;
+			let body = serde_json::json!({
+				"type": "error",
+				"error": {
+					"type": "invalid_request_error",
+					"message": "Token counting is not supported for this model or request."
+				}
+			});
 			let resp = ::http::Response::builder()
-				.status(::http::StatusCode::OK)
+				.status(::http::StatusCode::BAD_REQUEST)
 				.header(::http::header::CONTENT_TYPE, "application/json")
-				.body(Body::from(body))
-				.expect("failed to build count_tokens response");
+				.body(Body::from(body.to_string()))
+				.expect("failed to build count_tokens error response");
 			return Ok(RequestResult::Rejected(resp));
 		}
 
@@ -2331,7 +2394,17 @@ impl AIProvider {
 					bedrock::BedrockEndpoint::Mantle
 				) =>
 			{
-				serde_json::to_vec(req).map_err(AIError::RequestMarshal)
+				// bedrock-mantle names base model IDs — never cross-region
+				// inference profiles — so strip the geo prefix (global./eu./us.…
+				// → anthropic.…) from the body model. The caller-facing alias
+				// and every other field pass through verbatim.
+				let mut mantle_req = req.clone();
+				if let Some((_, base)) = request_model.split_once('.') {
+					if base.starts_with("anthropic.") {
+						mantle_req.model = Some(base.to_string());
+					}
+				}
+				serde_json::to_vec(&mantle_req).map_err(AIError::RequestMarshal)
 			},
 			AIProvider::Bedrock(_) => {
 				conversion::bedrock::from_anthropic_token_count::translate(req, headers)
@@ -2913,10 +2986,33 @@ impl AIProvider {
 		} = buffered;
 		parts.headers.remove(header::CONTENT_LENGTH);
 		if !parts.status.is_success() {
+			// bedrock-mantle answers count_tokens with the Anthropic error
+			// envelope (request ids, project/role ARNs and provider-side
+			// validation detail inside). Sanitize that arm to the client
+			// contract before generic error processing: typed 4xx keeps its
+			// class with a generic message, a denied project (403) becomes a
+			// generic 502 with no AWS internals, and 5xx stays transient.
+			// Never a fabricated count on any error path.
+			let (status, sanitized) = match self {
+				AIProvider::Bedrock(p)
+					if matches!(
+						p.resolve_endpoint(
+							RouteType::AnthropicTokenCount,
+							Some(&req.request_model),
+							None
+						),
+						bedrock::BedrockEndpoint::Mantle
+					) =>
+				{
+					sanitize_mantle_count_tokens_error(parts.status, &bytes)
+				},
+				_ => (parts.status, bytes),
+			};
+			parts.status = status;
 			let body = self.process_error(
 				&req,
 				parts.status,
-				&bytes,
+				&sanitized,
 				model_catalog.map(|c| c.as_handle()),
 			)?;
 			return Ok(Self::finalize_response(

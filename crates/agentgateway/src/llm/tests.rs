@@ -1380,6 +1380,45 @@ async fn count_tokens_uses_native_endpoint_after_model_alias() {
 	assert_eq!(llm_request.request_model, "claude-3-5-sonnet");
 }
 
+#[tokio::test]
+async fn count_tokens_without_native_endpoint_is_explicitly_rejected() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	let provider = custom_provider(custom::ProviderFormat::Completions);
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("localhost", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"test-model","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+	let RequestResult::Rejected(response) = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("unsupported count_tokens should return a typed error")
+	else {
+		panic!("expected direct rejection");
+	};
+	assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = response.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert_eq!(
+		error["error"]["message"],
+		"Token counting is not supported for this model or request."
+	);
+	assert!(error.get("input_tokens").is_none());
+}
+
 fn gemini_generate_content_request(uri: &str) -> ::http::Request<Body> {
 	::http::Request::builder()
 		.uri(uri)
@@ -4981,4 +5020,463 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 			.output,
 		ChatFormat::BedrockConverse
 	);
+}
+
+#[tokio::test]
+async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	// eu-west-1 provider (our production gateway Region): Opus 4.8's mantle
+	// card includes eu-west-1, so its count_tokens rides in-Region mantle —
+	// no environment input, EU residency preserved by construction.
+	let provider = AIProvider::bedrock(bedrock::Provider {
+		model_override: Some(strng::new("global.anthropic.claude-opus-4-8")),
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"global.anthropic.claude-opus-4-8","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+
+	let result = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("mantle count_tokens request should process");
+	let (forwarded, upstream_route_type) = match result {
+		RequestResult::Success {
+			request,
+			upstream_route_type,
+			..
+		} => (request, upstream_route_type),
+		RequestResult::Rejected(resp) => {
+			let b = resp.into_body().collect().await.unwrap().to_bytes();
+			panic!("rejected: {}", String::from_utf8_lossy(&b));
+		},
+		other => panic!("other variant: {other:?}"),
+	};
+
+	assert_eq!(upstream_route_type, RouteType::AnthropicTokenCount);
+	let forwarded_body = forwarded.collect().await.unwrap().to_bytes();
+	let forwarded_json: Value = serde_json::from_slice(&forwarded_body).unwrap();
+	// bedrock-mantle names base model IDs, never geo inference profiles.
+	assert_eq!(forwarded_json["model"], json!("anthropic.claude-opus-4-8"));
+	assert_eq!(forwarded_json["messages"][0]["content"], json!("hello"));
+}
+
+#[tokio::test]
+async fn count_tokens_opus_5_5_no_eu_mantle_region_fails_closed_pre_dispatch() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	// eu-west-1 provider: Opus 5.5's mantle availability (us-east-1 /
+	// ap-southeast-4 / GovCloud) has no EU Region, and there is deliberately
+	// no cross-region override — the count_tokens body must never be
+	// dispatched anywhere. The typed client-contract error is produced with
+	// ZERO upstream invocation (the enterprise prompt stays in the gateway),
+	// independent of any ambient environment.
+	let provider = AIProvider::bedrock(bedrock::Provider {
+		model_override: Some(strng::new("global.anthropic.claude-opus-5-5")),
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"global.anthropic.claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+	let RequestResult::Rejected(resp) = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("count_tokens request should process")
+	else {
+		panic!("expected typed pre-dispatch rejection");
+	};
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert!(
+		error.get("input_tokens").is_none_or(|v| v.is_null()),
+		"no fabricated count"
+	);
+}
+
+#[tokio::test]
+async fn count_tokens_sonnet_5_5_has_no_commercial_mantle_region() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	// Sonnet 5.5's mantle availability is GovCloud-only (outside the approved
+	// commercial perimeter entirely): rejected before dispatch, from every
+	// Region, with no environment input.
+	let provider = AIProvider::bedrock(bedrock::Provider {
+		model_override: Some(strng::new("global.anthropic.claude-sonnet-5-5")),
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"global.anthropic.claude-sonnet-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+	let RequestResult::Rejected(resp) = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("count_tokens request should process")
+	else {
+		panic!("expected typed pre-dispatch rejection");
+	};
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	assert!(String::from_utf8_lossy(&body).contains("not supported"));
+}
+
+#[tokio::test]
+async fn count_tokens_bedrock_mantle_success_preserves_exact_count() {
+	let body = bytes::Bytes::from_static(br#"{"input_tokens":4321}"#);
+	let mut parts = ::http::Response::new(()).into_parts().0;
+	parts.status = ::http::StatusCode::OK;
+	let buffered = BufferedResponse {
+		managed_body: Body::empty(),
+		parts,
+		bytes: body,
+	};
+
+	let resp = bedrock_provider()
+		.process_count_tokens_response(count_tokens_request(), buffered, None, &Default::default())
+		.expect("mantle count_tokens success should process");
+	assert_eq!(resp.status(), ::http::StatusCode::OK);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let payload: Value = serde_json::from_slice(&body).unwrap();
+	// Exact provider count, verbatim; never an estimate.
+	assert_eq!(payload["input_tokens"], json!(4321));
+}
+
+fn mantle_error_buffered(status: ::http::StatusCode, body: &'static [u8]) -> BufferedResponse {
+	let mut parts = ::http::Response::new(()).into_parts().0;
+	parts.status = status;
+	let buffered = BufferedResponse {
+		managed_body: Body::empty(),
+		parts,
+		bytes: bytes::Bytes::from_static(body),
+	};
+	buffered
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_mantle_beta_rejection_is_typed_never_a_count() {
+	// bedrock-mantle validates the count_tokens body with the inference
+	// schema; an unsupported beta or field arrives as an Anthropic-shaped 400.
+	let buffered = mantle_error_buffered(
+		::http::StatusCode::BAD_REQUEST,
+		br#"{"type":"error","request_id":"req_mantle_internal","error":{"type":"invalid_request_error","message":"Unexpected value(s) advanced-tool-use-2025-11-20 for the anthropic-beta header"}}"#,
+	);
+	let resp = bedrock_provider()
+		.process_count_tokens_response(count_tokens_request(), buffered, None, &Default::default())
+		.expect("mantle count_tokens error should process");
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	// No provider detail, no request id, and above all no fabricated count.
+	let text = String::from_utf8_lossy(&body);
+	for marker in ["req_mantle_internal", "advanced-tool-use", "anthropic-beta"] {
+		assert!(!text.contains(marker), "leaked {marker}: {text}");
+	}
+	assert!(error.get("input_tokens").is_none());
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_mantle_access_denied_is_sanitized() {
+	// bedrock-mantle:CountTokens on the project ARN, denied.
+	let buffered = mantle_error_buffered(
+		::http::StatusCode::FORBIDDEN,
+		br#"{"type":"error","request_id":"req_mantle_internal","error":{"type":"authentication_error","message":"User: arn:aws:sts::123456789012:assumed-role/prod-agentgateway-bedrock-irsa/session is not authorized to perform: bedrock-mantle:CountTokens on resource: arn:aws:bedrock-mantle:eu-west-1:123456789012:project/default"}}"#,
+	);
+	let resp = bedrock_provider()
+		.process_count_tokens_response(count_tokens_request(), buffered, None, &Default::default())
+		.expect("mantle count_tokens denial should process");
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_GATEWAY);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["error"]["type"], "api_error");
+	let text = String::from_utf8_lossy(&body);
+	for marker in [
+		"123456789012",
+		"assumed-role",
+		"prod-agentgateway-bedrock-irsa",
+		"bedrock-mantle:CountTokens",
+		"project/default",
+		"req_mantle_internal",
+	] {
+		assert!(!text.contains(marker), "leaked {marker}: {text}");
+	}
+	assert!(error.get("input_tokens").is_none());
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_mantle_unavailable_and_malformed_never_fabricate_counts() {
+	for (status, body) in [
+		(
+			::http::StatusCode::SERVICE_UNAVAILABLE,
+			br#"{"type":"error","error":{"type":"api_error","message":"Service unavailable, please retry."}}"# as &'static [u8],
+		),
+		(::http::StatusCode::BAD_REQUEST, br#"<html>malformed gateway body</html>"#),
+	] {
+		let buffered = mantle_error_buffered(status, body);
+		let resp = bedrock_provider()
+			.process_count_tokens_response(
+				count_tokens_request(),
+				buffered,
+				None,
+				&Default::default(),
+			)
+			.expect("mantle count_tokens failure should process");
+		// Unavailable surfaces as a gateway error; malformed input stays a
+		// client-error class. Neither may ever look like a successful count.
+		let expected = if status == ::http::StatusCode::SERVICE_UNAVAILABLE {
+			// Unavailable stays a retryable 503; auth-style failures are the
+			// ones remapped to 502.
+			::http::StatusCode::SERVICE_UNAVAILABLE
+		} else {
+			::http::StatusCode::BAD_REQUEST
+		};
+		assert_eq!(resp.status(), expected, "status={status}");
+		let body = resp.into_body().collect().await.unwrap().to_bytes();
+		let error: Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(error["type"], "error");
+		assert!(
+			error.get("input_tokens").is_none(),
+			"error path must never fabricate a count"
+		);
+		let text = String::from_utf8_lossy(&body);
+		assert!(!text.contains("Service unavailable, please retry."));
+		assert!(!text.contains("malformed gateway body"));
+	}
+}
+
+#[test]
+fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
+	// setup_request resolves the Bedrock endpoint per route type and provider
+	// region: EU-served CRIS-only Claude models ride the Anthropic-native
+	// count_tokens surface on in-Region bedrock-mantle; models with no legal
+	// surface here (Opus 5.5 has no EU mantle Region) fall through to the
+	// Runtime path shape — the gateway's pre-dispatch typed rejection is what
+	// actually serves them, setup_request staying on Runtime is defense in
+	// depth — and non-Anthropic models keep the Runtime CountTokens API path.
+	for (model, provider_region, expected_path, expects_mantle) in [
+		(
+			"global.anthropic.claude-opus-4-8",
+			"eu-west-1",
+			"/anthropic/v1/messages/count_tokens",
+			true,
+		),
+		(
+			"global.anthropic.claude-opus-5-5",
+			"us-east-1",
+			"/anthropic/v1/messages/count_tokens",
+			true,
+		),
+		(
+			"global.anthropic.claude-sonnet-5-5",
+			"us-east-1",
+			"/model/global.anthropic.claude-sonnet-5-5/count-tokens",
+			false,
+		),
+		(
+			"openai.gpt-6-luna",
+			"us-east-1",
+			"/model/openai.gpt-6-luna/count-tokens",
+			false,
+		),
+	] {
+		let provider = bedrock_provider_with_region(provider_region);
+		let provider = bedrock_provider();
+		let llm_request = LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::CountTokens,
+			cache_convention: CacheTokenConvention::pending(),
+			request_model: model.into(),
+			provider: "aws.bedrock".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
+		};
+		let mut req = crate::http::tests_common::request(
+			"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
+			http::Method::POST,
+			&[],
+		);
+		provider
+			.setup_request(
+				&mut req,
+				RouteType::AnthropicTokenCount,
+				Some(&llm_request),
+				None,
+				None,
+				false,
+				None,
+				None,
+			)
+			.expect("setup_request should succeed");
+		assert_eq!(req.uri().path(), expected_path, "model={model}");
+		let has_version = req.headers().contains_key("anthropic-version");
+		assert_eq!(has_version, expects_mantle, "model={model}");
+	}
+}
+
+#[test]
+fn count_tokens_bedrock_mantle_signing_region_is_provider_region() {
+	// Mantle endpoint (EU-served CRIS-only Claude, count-tokens route): the
+	// SigV4 signing region IS the provider's own Region — in-Region mantle is
+	// the only legal path, so host and signature never leave it.
+	let provider = bedrock_provider_with_region("eu-west-1");
+	let llm_request = LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::CountTokens,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: "global.anthropic.claude-opus-4-8".into(),
+		provider: "aws.bedrock".into(),
+		streaming: false,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
+	};
+	let mut req = crate::http::tests_common::request(
+		"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
+		http::Method::POST,
+		&[],
+	);
+	provider
+		.setup_request(
+			&mut req,
+			RouteType::AnthropicTokenCount,
+			Some(&llm_request),
+			None,
+			None,
+			false,
+			None,
+			None,
+		)
+		.expect("setup_request should succeed");
+	assert_eq!(req.uri().path(), "/anthropic/v1/messages/count_tokens");
+	assert_eq!(
+		req
+			.extensions()
+			.get::<bedrock::AwsRegion>()
+			.map(|region| region.region.as_str()),
+		Some("eu-west-1")
+	);
+
+	// Runtime endpoint (non-Anthropic model): the signing region stays the
+	// provider's own Region as before.
+	let mut req = crate::http::tests_common::request(
+		"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
+		http::Method::POST,
+		&[],
+	);
+	let runtime_llm_request = LLMRequest {
+		request_model: "openai.gpt-6-luna".into(),
+		..llm_request
+	};
+	provider
+		.setup_request(
+			&mut req,
+			RouteType::AnthropicTokenCount,
+			Some(&runtime_llm_request),
+			None,
+			None,
+			false,
+			None,
+			None,
+		)
+		.expect("setup_request should succeed");
+	assert_eq!(req.uri().path(), "/model/openai.gpt-6-luna/count-tokens");
+	assert_eq!(
+		req
+			.extensions()
+			.get::<bedrock::AwsRegion>()
+			.map(|region| region.region.as_str()),
+		Some("eu-west-1")
+	);
+}
+
+/// Count-tokens LLMRequest for the mantle response-processing tests: a
+/// CRIS-only Claude model (the family whose count-tokens surface is
+/// bedrock-mantle only), named by its geo inference profile.
+fn count_tokens_request() -> LLMRequest {
+	LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::CountTokens,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: "global.anthropic.claude-opus-5-5".into(),
+		provider: "aws.bedrock".into(),
+		streaming: false,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
+	}
+}
+
+fn bedrock_provider() -> AIProvider {
+	bedrock_provider_with_region("us-east-1")
+}
+
+fn bedrock_provider_with_region(region: &str) -> AIProvider {
+	AIProvider::bedrock(bedrock::Provider {
+		model_override: None,
+		region: strng::new(region),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	})
 }
