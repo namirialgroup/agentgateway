@@ -76,11 +76,25 @@ pub fn translate_anthropic_error(
 	if serde_json::from_slice::<messages::MessagesErrorResponse>(bytes).is_ok() {
 		return Ok(bytes.clone());
 	}
+	// Bedrock Runtime InvokeModel (native Messages transport) failures are
+	// plain provider JSON such as {"message": "..."}, not Anthropic error
+	// envelopes; surface their message field directly (mirroring the native
+	// stream-frame exception handling), then classify context overflow so the
+	// native leg keeps the same compact-and-retry marker. Anthropic-native
+	// bodies returned above stay untouched so direct legs keep their verbatim
+	// semantics.
+	let mut message = serde_json::from_slice::<serde_json::Value>(bytes)
+		.ok()
+		.and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+		.unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+	if super::context_overflow_marker::is_context_overflow(status, None, &message) {
+		super::context_overflow_marker::mark(&mut message);
+	}
 	let m = messages::MessagesErrorResponse {
 		r#type: "error".to_string(),
 		error: messages::MessagesError {
 			r#type: anthropic_error_type(status).to_string(),
-			message: String::from_utf8_lossy(bytes).into_owned(),
+			message,
 		},
 	};
 	Ok(Bytes::from(

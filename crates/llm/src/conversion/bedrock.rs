@@ -2129,8 +2129,17 @@ pub mod from_messages {
 		adapter.to_anthropic(tool_name_map)
 	}
 
-	pub fn translate_error(bytes: &Bytes) -> Result<Bytes, AIError> {
-		let message = super::error_message(bytes);
+	pub fn translate_error(
+		bytes: &Bytes,
+		status: ::http::StatusCode,
+	) -> Result<Bytes, AIError> {
+		let mut message = super::error_message(bytes);
+		// Bedrock Converse reports a context-length rejection as a plain 400
+		// ValidationException message; classify it so clients receive the same
+		// compact-and-retry marker as every other transport.
+		if crate::conversion::context_overflow_marker::is_context_overflow(status, None, &message) {
+			crate::conversion::context_overflow_marker::mark(&mut message);
+		}
 		let m = types::messages::typed::MessagesErrorResponse {
 			r#type: "".to_owned(),
 			error: types::messages::typed::MessagesError {

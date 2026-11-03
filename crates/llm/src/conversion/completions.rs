@@ -780,32 +780,14 @@ pub mod from_messages {
 		let mut res = super::parse_chat_completion_error(bytes)?;
 		// Claude Code uses this marker to compact and retry a rejected prompt.
 		// Do not override an existing capability marker or a different structured code.
-		let context_overflow = status == ::http::StatusCode::BAD_REQUEST
-			&& match res.error.code.as_ref().and_then(Value::as_str) {
-				Some(code) => code == "context_length_exceeded",
-				None => {
-					let message = res.error.message.to_ascii_lowercase();
-					[
-						"prompt is too long",
-						"input is too long for requested model",
-						"exceeds the context window",
-						"exceed context limit",
-						"maximum context length is",
-						"model's maximum context limit",
-						"is longer than the model's context length",
-						"input tokens exceed the configured limit",
-						"exceeds the available context size",
-					]
-					.iter()
-					.any(|pattern| message.contains(pattern))
-				},
-			};
+		let context_overflow = crate::conversion::context_overflow_marker::is_context_overflow(
+			status,
+			res.error.code.as_ref().and_then(Value::as_str),
+			&res.error.message,
+		);
 		if context_overflow {
 			res.error.r#type = Some("invalid_request_error".to_string());
-			if !res.error.message.contains("capability_rejected:") {
-				// Keep a whitespace boundary after the capability token.
-				res.error.message = format!("capability_rejected: prompt_too_long {}", res.error.message);
-			}
+			crate::conversion::context_overflow_marker::mark(&mut res.error.message);
 		}
 		let m = messages::MessagesErrorResponse {
 			r#type: "error".to_string(),

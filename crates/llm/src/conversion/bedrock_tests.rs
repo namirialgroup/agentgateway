@@ -1490,6 +1490,77 @@ fn test_completions_error_translation_wraps_non_json_body() {
 	);
 }
 
+mod context_overflow {
+	use bytes::Bytes;
+	use http::StatusCode;
+	use serde_json::{Value, json};
+
+	fn check(body: Value, status: StatusCode, message: &str) {
+		let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+		let translated = super::from_messages::translate_error(&bytes, status).unwrap();
+		let translated: Value = serde_json::from_slice(&translated).unwrap();
+		assert_eq!(
+			translated["error"]["type"], "invalid_request_error",
+			"status={status}, body={body}"
+		);
+		assert_eq!(translated["error"]["message"], message, "status={status}, body={body}");
+	}
+
+	#[test]
+	fn converse_validation_exception_gets_the_compaction_marker() {
+		// Bedrock Converse context-length rejection shape (ValidationException).
+		check(
+			json!({"message": "Input is too long for requested model. Please reduce the input length and retry."}),
+			StatusCode::BAD_REQUEST,
+			"capability_rejected: prompt_too_long Input is too long for requested model. Please reduce the input length and retry.",
+		);
+	}
+
+	#[test]
+	fn existing_capability_marker_is_preserved() {
+		check(
+			json!({"message": "capability_rejected: prompt_too_long Input exceeds the model context window."}),
+			StatusCode::BAD_REQUEST,
+			"capability_rejected: prompt_too_long Input exceeds the model context window.",
+		);
+	}
+
+	#[test]
+	fn unrelated_400_messages_are_not_context_overflow() {
+		// The second body is the real Production beta-rejection message observed
+		// on the native transport (2026-11-03 opus migration window): a request
+		// defect, never a context-length condition.
+		for message in [
+			"The model is overloaded. Please try again later.",
+			"Unexpected value(s) advanced-tool-use-2025-11-20 for the anthropic-beta header",
+		] {
+			check(
+				json!({"message": message}),
+				StatusCode::BAD_REQUEST,
+				message,
+			);
+		}
+	}
+
+	#[test]
+	fn non_400_statuses_never_get_the_marker() {
+		// False-positive guard: matching text on a throttle or auth status
+		// keeps its own class; only a 400 context-length rejection compacts.
+		for status in [
+			StatusCode::UNAUTHORIZED,
+			StatusCode::FORBIDDEN,
+			StatusCode::TOO_MANY_REQUESTS,
+			StatusCode::INTERNAL_SERVER_ERROR,
+		] {
+			check(
+				json!({"message": "Input is too long for requested model."}),
+				status,
+				"Input is too long for requested model.",
+			);
+		}
+	}
+}
+
 fn make_message(role: types::bedrock::Role, text: &str) -> types::bedrock::Message {
 	types::bedrock::Message {
 		role,

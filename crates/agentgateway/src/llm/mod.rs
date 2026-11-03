@@ -960,7 +960,7 @@ impl ChatTranslation {
 			ChatFormat::BedrockConverse => match format {
 				ChatErrorFormat::Bedrock => match self.input {
 					InputFormat::Completions => conversion::bedrock::from_completions::translate_error(bytes),
-					InputFormat::Messages => conversion::bedrock::from_messages::translate_error(bytes),
+					InputFormat::Messages => conversion::bedrock::from_messages::translate_error(bytes, status),
 					InputFormat::Responses => conversion::bedrock::from_responses::translate_error(bytes),
 					_ => unsupported(),
 				},

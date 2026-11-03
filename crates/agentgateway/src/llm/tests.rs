@@ -5162,3 +5162,64 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 		ChatFormat::BedrockConverse
 	);
 }
+
+#[test]
+fn context_overflow_marker_is_uniform_across_transports() {
+	// P1 2026-11-02 parity: every transport serving Anthropic Messages
+	// clients must classify a provider context-length 400 with the
+	// `capability_rejected: prompt_too_long` marker so clients compact and
+	// retry instead of stalling. The OpenAI-compat path already did; the
+	// Bedrock Converse and native Messages legs must match it.
+	let converse_overflow = Bytes::from_static(
+		br#"{"message":"Input is too long for requested model. Please reduce the input length and retry."}"#,
+	);
+	let invoke_model_overflow =
+		Bytes::from_static(br#"{"message":"prompt is too long: 213418 tokens > 200000 maximum"}"#);
+	for (output, format, body) in [
+		// Bedrock Converse leg (sonnet/haiku routes today).
+		(
+			ChatFormat::BedrockConverse,
+			ChatErrorFormat::Bedrock,
+			&converse_overflow,
+		),
+		// Native Messages transport (Bedrock Runtime InvokeModel) and
+		// Anthropic-direct legs share the Anthropic-format error translation.
+		(
+			ChatFormat::AnthropicMessages,
+			ChatErrorFormat::Anthropic,
+			&invoke_model_overflow,
+		),
+	] {
+		let translation = ChatTranslation {
+			input: InputFormat::Messages,
+			output,
+		};
+		let translated = translation
+			.error(body, http::StatusCode::BAD_REQUEST, format)
+			.unwrap();
+		let error: Value = serde_json::from_slice(&translated).unwrap();
+		assert!(
+			error["error"]["message"]
+				.as_str()
+				.unwrap()
+				.starts_with("capability_rejected: prompt_too_long"),
+			"output={:?}",
+			output
+		);
+
+		// False-positive guard: the same bodies keep their own class on
+		// non-400 statuses (throttle/auth/outage must never compact).
+		let translated = translation
+			.error(body, http::StatusCode::TOO_MANY_REQUESTS, format)
+			.unwrap();
+		let error: Value = serde_json::from_slice(&translated).unwrap();
+		assert!(
+			!error["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("capability_rejected:"),
+			"output={:?}",
+			output
+		);
+	}
+}

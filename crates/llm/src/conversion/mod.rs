@@ -8,6 +8,61 @@ pub mod responses;
 pub mod vertex;
 pub mod vertex_gemini;
 
+/// Context-overflow (`prompt is too long`) classification shared by every
+/// client-visible error-translation path. Claude Code-family clients use the
+/// `capability_rejected: prompt_too_long` message marker to compact and retry
+/// a rejected prompt, so every transport must classify the same upstream
+/// conditions. Before this module the Bedrock Converse and native Messages
+/// legs passed provider text through unclassified, turning a real
+/// context-length rejection into a client-side stall with no recovery signal.
+pub(crate) mod context_overflow_marker {
+	/// Lowercased message fragments that identify a provider-confirmed
+	/// context-length rejection across surfaces (Anthropic direct, Bedrock
+	/// Converse ValidationException, Bedrock InvokeModel, OpenAI-compat
+	/// gateways). Keep in sync with `completions_tests.rs::context_overflow`.
+	const PATTERNS: &[&str] = &[
+		"prompt is too long",
+		"input is too long for requested model",
+		"exceeds the context window",
+		"exceed context limit",
+		"maximum context length is",
+		"model's maximum context limit",
+		"is longer than the model's context length",
+		"input tokens exceed the configured limit",
+		"exceeds the available context size",
+	];
+
+	/// Only a 400 with a provider-confirmed context-length condition counts;
+	/// throttling, auth, policy and outage statuses keep their own classes.
+	/// A structured code wins: when the upstream reports one, the message text
+	/// is not consulted (do not override a different structured code).
+	pub(crate) fn is_context_overflow(
+		status: ::http::StatusCode,
+		code: Option<&str>,
+		message: &str,
+	) -> bool {
+		if status != ::http::StatusCode::BAD_REQUEST {
+			return false;
+		}
+		match code {
+			Some(code) => code == "context_length_exceeded",
+			None => {
+				let message = message.to_ascii_lowercase();
+				PATTERNS.iter().any(|pattern| message.contains(pattern))
+			},
+		}
+	}
+
+	/// Prefix the safe compact-and-retry marker, preserving any marker a
+	/// provider or upstream gateway already emitted.
+	pub(crate) fn mark(message: &mut String) {
+		if !message.contains("capability_rejected:") {
+			// Keep a whitespace boundary after the capability token.
+			*message = format!("capability_rejected: prompt_too_long {}", message);
+		}
+	}
+}
+
 #[derive(Default)]
 struct ProviderUsage {
 	input_tokens: u64,

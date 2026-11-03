@@ -534,3 +534,56 @@ async fn passthrough_stream_consistent_message_start_split_becomes_evidence() {
 	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(67759));
 	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
 }
+
+mod anthropic_error_translation {
+	use bytes::Bytes;
+	use http::StatusCode;
+	use serde_json::{Value, json};
+
+	fn translate(body: Value, status: StatusCode) -> Value {
+		let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+		let translated = crate::conversion::messages::translate_anthropic_error(&bytes, status).unwrap();
+		serde_json::from_slice(&translated).unwrap()
+	}
+
+	#[test]
+	fn anthropic_native_error_body_passes_through_untouched() {
+		let native = json!({
+			"type": "error",
+			"error": {"type": "invalid_request_error", "message": "prompt is too long: 213418 tokens > 200000 maximum"}
+		});
+		let translated = translate(native.clone(), StatusCode::BAD_REQUEST);
+		assert_eq!(translated, native);
+	}
+
+	#[test]
+	fn bedrock_invoke_model_overflow_gets_the_compaction_marker() {
+		// Bedrock Runtime InvokeModel (native Messages transport) failures are
+		// plain provider JSON, not Anthropic error envelopes.
+		let translated = translate(
+			json!({"message": "prompt is too long: 213418 tokens > 200000 maximum"}),
+			StatusCode::BAD_REQUEST,
+		);
+		assert_eq!(translated["error"]["type"], "invalid_request_error");
+		assert_eq!(
+			translated["error"]["message"],
+			"capability_rejected: prompt_too_long prompt is too long: 213418 tokens > 200000 maximum"
+		);
+	}
+
+	#[test]
+	fn non_overflow_and_non_400_bodies_keep_their_class() {
+		let translated = translate(
+			json!({"message": "The model is overloaded."}),
+			StatusCode::BAD_REQUEST,
+		);
+		assert_eq!(translated["error"]["message"], "The model is overloaded.");
+
+		let throttled = translate(
+			json!({"message": "Input is too long for requested model."}),
+			StatusCode::TOO_MANY_REQUESTS,
+		);
+		assert_eq!(throttled["error"]["type"], "rate_limit_error");
+		assert_eq!(throttled["error"]["message"], "Input is too long for requested model.");
+	}
+}
