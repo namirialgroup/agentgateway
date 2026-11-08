@@ -4982,3 +4982,320 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 		ChatFormat::BedrockConverse
 	);
 }
+
+// ---------------------------------------------------------------------------
+// Anthropic Direct count_tokens — native-forward proof tests (2026-11-08).
+//
+// The deployed Claude 5.5 route (#509 single-group Anthropic count backends on
+// the RC2 lineage) forwards POST /v1/messages/count_tokens to api.anthropic.com
+// natively. The local tiktoken estimator in `process_count_tokens_request`
+// (`use_local`) is UNREACHABLE for the Anthropic provider — these tests pin
+// that property: if the upstream result is ever replaced by the local estimate
+// (or the forward degrades to a local calculation), the assertions below go
+// RED. Fixture constants are live-anchored: for the single-message payload
+// "Count these words please." the RC2 local estimator (tiktoken cl100k, 3+1+
+// content+3) computes 12, while the real Anthropic count (observed live,
+// 2026-11-06 GO10 probe J, RC2 deployed) is 14 — so "native" and "local" can
+// never be confused for this fixture.
+// ---------------------------------------------------------------------------
+
+fn count_tokens_probe_messages() -> Vec<SimpleChatCompletionMessage> {
+	vec![SimpleChatCompletionMessage {
+		role: "user".into(),
+		content: "Count these words please.".into(),
+	}]
+}
+
+/// LOCAL_ESTIMATE_PROBE_J: the RC2 local estimator value for
+/// `count_tokens_probe_messages()` on any non-OpenAI model (cl100k fallback).
+/// Pinned so a regression that swaps the native count for the local estimate
+/// fails the equality assertions in this section, not just a snapshot.
+#[test]
+fn count_tokens_local_estimator_pinned_divergence_from_native() {
+	let local = num_tokens_from_messages("claude-sonnet-5-5", &count_tokens_probe_messages())
+		.expect("claude models estimate via the cl100k fallback");
+	assert_eq!(local, 12, "local cl100k estimate drifted — re-pin the fixture constants");
+	assert_ne!(local, 14, "local estimate equals the native fixture count; the fixture no longer discriminates");
+}
+
+/// T1 — the provider model override is stamped into the forwarded count_tokens
+/// body (Synapse/Bedrock alias → Anthropic native id) and the payload leaves
+/// verbatim: unknown top-level fields, client tools, system, per-block
+/// cache_control and URL-shaped content are never stripped to manufacture a
+/// count.
+#[tokio::test]
+async fn count_tokens_stamps_provider_model_and_forwards_payload_verbatim() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: Some(strng::new("claude-sonnet-5-5")),
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("api.anthropic.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{
+				"model": "client-alias-sonnet",
+				"system": "You are a counting assistant.",
+				"tools": [{
+					"type": "custom",
+					"name": "get_weather",
+					"description": "Look up weather",
+					"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+				}],
+				"messages": [{
+					"role": "user",
+					"content": [
+						{"type": "text", "text": "Count these words please.", "cache_control": {"type": "ephemeral"}},
+						{"type": "image", "source": {"type": "url", "url": "https://imgs.example.test/pic.png"}}
+					]
+				}],
+				"synapse_probe_unknown_field": {"kept": true}
+			}"#
+				.to_vec(),
+		))
+		.unwrap();
+
+	let RequestResult::Success {
+		request: forwarded,
+		llm_request,
+		upstream_route_type,
+	} = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("count_tokens request should process")
+	else {
+		panic!("expected forwarded request (Anthropic provider must never answer count_tokens locally)");
+	};
+
+	assert_eq!(upstream_route_type, RouteType::AnthropicTokenCount);
+	let forwarded_body = forwarded.collect().await.unwrap().to_bytes();
+	let forwarded_json: Value =
+		serde_json::from_slice(&forwarded_body).expect("forwarded request should be JSON");
+
+	assert_eq!(forwarded_json["model"], json!("claude-sonnet-5-5"), "provider model override must stamp the native Anthropic id");
+	assert_eq!(llm_request.request_model.as_str(), "claude-sonnet-5-5");
+	assert_eq!(forwarded_json["synapse_probe_unknown_field"], json!({"kept": true}), "unknown top-level fields must survive verbatim");
+	assert_eq!(forwarded_json["tools"][0]["name"], json!("get_weather"), "client tools must survive verbatim");
+	assert_eq!(forwarded_json["system"], json!("You are a counting assistant."), "system prompt must survive verbatim");
+	assert_eq!(
+		forwarded_json["messages"][0]["content"][0]["cache_control"],
+		json!({"type": "ephemeral"}),
+		"cache_control must survive verbatim"
+	);
+	assert_eq!(
+		forwarded_json["messages"][0]["content"][1]["source"]["type"],
+		json!("url"),
+		"URL-backed content must be forwarded untouched (unsupported shapes are the upstream's typed 400, never a silent strip)"
+	);
+}
+
+/// T2 — the response side is byte-faithful native passthrough: the upstream
+/// `{"input_tokens": N}` body is returned EXACTLY and the telemetry count is
+/// the upstream value. If the outbound result is ever replaced by the old
+/// local tiktoken estimate, both assertions go RED (local estimate for this
+/// fixture is 12, the native fixture count is 14).
+#[tokio::test]
+async fn count_tokens_native_response_passes_through_and_is_not_local_estimate() {
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let req = LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::CountTokens,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: "claude-sonnet-5-5".into(),
+		provider: "anthropic".into(),
+		streaming: false,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
+	};
+	let upstream = bytes::Bytes::from_static(br#"{"input_tokens":14}"#);
+	let mut parts = ::http::Response::new(()).into_parts().0;
+	parts.status = ::http::StatusCode::OK;
+	let buffered = BufferedResponse {
+		managed_body: Body::empty(),
+		parts,
+		bytes: upstream.clone(),
+	};
+
+	let log = AsyncLog::<llm::LLMInfo>::default();
+	let resp = provider
+		.process_count_tokens_response(req, buffered, None, &log)
+		.expect("native count_tokens response should process");
+
+	assert_eq!(resp.status(), ::http::StatusCode::OK);
+	assert_eq!(
+		resp.into_body().collect().await.unwrap().to_bytes(),
+		upstream,
+		"response must be the byte-faithful upstream body, not a reserialized local estimate"
+	);
+	let info = log.take().expect("llm info");
+	assert_eq!(info.response.count_tokens, Some(14), "telemetry count must be the UPSTREAM value");
+	assert_ne!(
+		info.response.count_tokens,
+		Some(num_tokens_from_messages("claude-sonnet-5-5", &count_tokens_probe_messages()).unwrap_or(0)),
+		"telemetry count equals the local cl100k estimate — the outbound result was replaced by the local estimator"
+	);
+}
+
+/// T3 — shapes Anthropic's count_tokens endpoint rejects (server tools, MCP
+/// connector definitions, URL-backed media) are forwarded verbatim so the
+/// upstream's typed `invalid_request_error` is the client-visible outcome.
+/// The gateway must never strip them to manufacture a successful count.
+#[tokio::test]
+async fn count_tokens_unsupported_shapes_forward_verbatim() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("api.anthropic.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{
+				"model": "claude-sonnet-5-5",
+				"tools": [{"type": "web_search_20250305", "name": "web_search"}],
+				"mcp_servers": [{"name": "docs", "url": "https://mcp.example.test"}],
+				"messages": [{
+					"role": "user",
+					"content": [
+						{"type": "text", "text": "Count with tools."},
+						{"type": "document", "source": {"type": "url", "url": "https://docs.example.test/a.pdf"}}
+					]
+				}]
+			}"#
+				.to_vec(),
+		))
+		.unwrap();
+
+	let RequestResult::Success { request: forwarded, .. } = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("count_tokens request should process")
+	else {
+		panic!("expected forwarded request for unsupported shapes (typed upstream rejection, not local refusal)");
+	};
+
+	let forwarded_json: Value =
+		serde_json::from_slice(&forwarded.collect().await.unwrap().to_bytes()).unwrap();
+	assert_eq!(forwarded_json["tools"][0]["type"], json!("web_search_20250305"), "server tool must survive verbatim");
+	assert_eq!(forwarded_json["mcp_servers"][0]["url"], json!("https://mcp.example.test"), "MCP connector must survive verbatim");
+	assert_eq!(
+		forwarded_json["messages"][0]["content"][1]["source"]["type"],
+		json!("url"),
+		"URL-backed document must survive verbatim"
+	);
+}
+
+/// T4 — upstream count_tokens errors pass through byte-faithful with status,
+/// rate-limit and correlation headers intact (429 Retry-After, request ids):
+/// the client sees Anthropic's own typed error envelope, never a substituted
+/// local count and never a reshaped error.
+#[tokio::test]
+async fn count_tokens_upstream_errors_keep_status_retry_after_and_correlation() {
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let cases: [(&[u8], ::http::StatusCode); 3] = [
+		(
+			br#"{"type":"error","error":{"type":"invalid_request_error","message":"Testing tool use with a server tool is not supported by count_tokens"}}"#,
+			::http::StatusCode::BAD_REQUEST,
+		),
+		(
+			br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+			::http::StatusCode::UNAUTHORIZED,
+		),
+		(
+			br#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}"#,
+			::http::StatusCode::TOO_MANY_REQUESTS,
+		),
+	];
+	for (body, status) in cases {
+		let req = LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::CountTokens,
+			cache_convention: CacheTokenConvention::pending(),
+			request_model: "claude-sonnet-5-5".into(),
+			provider: "anthropic".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
+		};
+		let upstream = bytes::Bytes::from_static(body);
+		let mut parts = ::http::Response::new(()).into_parts().0;
+		parts.status = status;
+		parts.headers.insert(
+			::http::header::RETRY_AFTER,
+			::http::HeaderValue::from_static("17"),
+		);
+		parts.headers.insert(
+			"request-id",
+			::http::HeaderValue::from_static("req_ct_probe_01"),
+		);
+		let buffered = BufferedResponse {
+			managed_body: Body::empty(),
+			parts,
+			bytes: upstream.clone(),
+		};
+
+		let resp = provider
+			.process_count_tokens_response(req, buffered, None, &Default::default())
+			.expect("error response should process");
+		assert_eq!(resp.status(), status, "upstream status must be preserved");
+		assert_eq!(resp.headers().get(::http::header::RETRY_AFTER).unwrap(), "17", "Retry-After must be preserved for 429s");
+		assert_eq!(resp.headers().get("request-id").unwrap(), "req_ct_probe_01", "correlation headers must be preserved");
+		assert_eq!(
+			resp.into_body().collect().await.unwrap().to_bytes(),
+			upstream,
+			"error envelope must pass through byte-faithful (typed Anthropic outcome)"
+		);
+	}
+}
+
+/// T5 — count_tokens requests never carry inference usage or prompt
+/// material into telemetry: `input_tokens`/`output_tokens` stay unset and the
+/// prompt is not recorded, so the accounting tap sees no billable attempt and
+/// no prompt content (cost total for the live route is 0 — verified 2026-11-07
+/// prod logs).
+#[test]
+fn count_tokens_requests_carry_no_inference_usage_or_prompt() {
+	let parsed: types::count_tokens::Request = serde_json::from_value(json!({
+		"model": "claude-sonnet-5-5",
+		"messages": [{"role": "user", "content": "Count these words please."}],
+		"system": "secret system prompt should not reach telemetry"
+	}))
+	.expect("count_tokens body should parse");
+
+	let llm_req = parsed
+		.to_llm_request(strng::new("anthropic"), false)
+		.expect("to_llm_request should succeed");
+	assert_eq!(llm_req.input_format, InputFormat::CountTokens);
+	assert_eq!(llm_req.input_tokens, None, "count_tokens must never set inference input usage");
+	assert!(llm_req.prompt.is_none(), "count_tokens must never record prompt content in telemetry");
+	assert!(!llm_req.streaming);
+	assert_eq!(llm_req.request_model.as_str(), "claude-sonnet-5-5");
+}
