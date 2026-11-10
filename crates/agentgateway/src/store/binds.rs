@@ -1456,8 +1456,10 @@ impl Store {
 		pol
 	}
 
-	pub fn all_shutdown_policies(&self) -> Vec<Box<dyn FnOnce() + Send + Sync + 'static>> {
-		type ShutdownPolicy = Box<dyn FnOnce() + Send + Sync + 'static>;
+	pub fn all_shutdown_policies(
+		&self,
+	) -> Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>> {
+		type ShutdownPolicy = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 		self
 			.policies_by_key
@@ -1466,17 +1468,23 @@ impl Store {
 			.filter_map(|v| match v {
 				FrontendPolicy::Tracing(t) => {
 					let tracer_policy = Arc::clone(t);
-					Some(Box::new(move || {
-						if let Some(t) = tracer_policy.tracer.get() {
-							t.shutdown()
+					Some(Box::pin(async move {
+						if let Some(tracer) = tracer_policy.tracer.get().cloned() {
+							// The main runtime is current-thread in standalone mode. Blocking it here
+							// prevents the OTLP exporter task (spawned on that runtime) from running,
+							// so the final batch always times out. Shutdown off-thread and yield.
+							let _ = tokio::task::spawn_blocking(move || tracer.shutdown()).await;
 						}
 					}) as ShutdownPolicy)
 				},
 				FrontendPolicy::AccessLog(t) => {
 					let access_log_policy = t.access_log_policy.clone();
-					Some(Box::new(move || {
-						if let Some(t) = access_log_policy.as_ref().and_then(|l| l.logger.get()) {
-							t.shutdown()
+					Some(Box::pin(async move {
+						if let Some(logger) = access_log_policy
+							.as_ref()
+							.and_then(|log_policy| log_policy.logger.get().cloned())
+						{
+							let _ = tokio::task::spawn_blocking(move || logger.shutdown()).await;
 						}
 					}) as ShutdownPolicy)
 				},

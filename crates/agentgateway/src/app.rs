@@ -297,6 +297,8 @@ pub struct Bound {
 	stores: crate::store::Stores,
 }
 
+type ShutdownPolicy = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
 impl Bound {
 	pub fn readiness(&self) -> readiness::Ready {
 		self.ready.clone()
@@ -307,25 +309,40 @@ impl Bound {
 	}
 
 	pub async fn wait_termination(self) -> anyhow::Result<()> {
-		// Wait for a signal to shutdown from explicit admin shutdown or signal
-		self.shutdown.wait().await;
-
-		let sdp = {
-			let b = self.stores.binds.read();
+		let Self {
+			shutdown,
+			drain_tx,
+			stores,
+			..
+		} = self;
+		wait_termination_with_policies(shutdown, drain_tx, move || {
+			let b = stores.binds.read();
 			b.all_shutdown_policies()
-		};
-		for p in sdp {
-			p();
-		}
-
-		// Start a drain; this will attempt to end all connections
-		// or itself be interrupted by a stronger TERM signal, whichever comes first.
-		self
-			.drain_tx
-			.start_drain_and_wait(drain::DrainMode::Graceful)
-			.await;
-
+		})
+		.await;
 		Ok(())
+	}
+}
+
+async fn wait_termination_with_policies<F>(
+	shutdown: signal::Shutdown,
+	drain_tx: drain::DrainTrigger,
+	shutdown_policies: F,
+) where
+	F: FnOnce() -> Vec<ShutdownPolicy> + Send + 'static,
+{
+	// Wait for a signal to shutdown from explicit admin shutdown or signal.
+	shutdown.wait().await;
+
+	// Request logs emit their final spans while in-flight connections finish. Keep the
+	// tracing and logging providers alive until those connections have drained; otherwise
+	// their final spans are rejected by an already-shut-down telemetry provider.
+	drain_tx
+		.start_drain_and_wait(drain::DrainMode::Graceful)
+		.await;
+
+	for policy in shutdown_policies() {
+		policy.await;
 	}
 }
 
@@ -387,4 +404,71 @@ fn new_data_plane_pool(
 
 	let handle = rx_handle.recv().unwrap();
 	(handle, tx)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{Arc, Mutex};
+	use std::time::Duration;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn termination_drains_in_flight_work_before_shutdown_policies() {
+		let shutdown = signal::Shutdown::new();
+		let shutdown_trigger = shutdown.trigger();
+		let (drain_tx, drain_rx) = drain::new();
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let policy_events = Arc::clone(&events);
+		let termination = tokio::spawn(wait_termination_with_policies(
+			shutdown,
+			drain_tx,
+			move || {
+				policy_events.lock().unwrap().push("collected");
+				let policy_events = Arc::clone(&policy_events);
+			vec![Box::pin(async move {
+				policy_events.lock().unwrap().push("shutdown");
+			}) as ShutdownPolicy]
+			},
+		));
+
+		shutdown_trigger.shutdown_now().await;
+		tokio::time::sleep(Duration::from_millis(25)).await;
+		assert!(
+			events.lock().unwrap().is_empty(),
+			"shutdown policies ran while an in-flight drain watcher was held"
+		);
+
+		// Request/connection finalization releases its watcher only after final spans are emitted.
+		drop(drain_rx);
+		tokio::time::timeout(Duration::from_secs(1), termination)
+			.await
+			.expect("termination did not finish after the drain watcher was released")
+			.expect("termination task panicked");
+		assert_eq!(*events.lock().unwrap(), ["collected", "shutdown"]);
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn shutdown_policy_yields_runtime_while_exporter_completes() {
+		let (export_done, export_rx) = mpsc::channel();
+		let exporter = tokio::spawn(async move {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+			export_done
+				.send(())
+				.expect("shutdown policy is still waiting for the export");
+		});
+		let policy = Box::pin(async move {
+			let _ = tokio::task::spawn_blocking(move || {
+				export_rx
+					.recv_timeout(Duration::from_secs(1))
+					.expect("current-thread runtime was blocked by shutdown");
+			})
+			.await;
+		}) as ShutdownPolicy;
+
+		tokio::time::timeout(Duration::from_secs(2), policy)
+			.await
+			.expect("shutdown policy deadlocked the current-thread runtime");
+		exporter.await.expect("exporter task panicked");
+	}
 }
