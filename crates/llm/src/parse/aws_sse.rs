@@ -176,6 +176,30 @@ pub fn transform_multi<O: Serialize>(
 	})
 }
 
+/// Like [`transform_multi`], but the closure returns the already-encoded
+/// payload `Bytes` verbatim. Use this when the upstream frame payload must
+/// reach the client byte-identically (no serde re-serialization, no key
+/// reordering) — e.g. the native Bedrock Messages transport, whose frame
+/// payloads are Anthropic event JSON documents.
+pub fn transform_raw(
+	b: Body,
+	buffer_limit: usize,
+	mut f: impl FnMut(Message) -> Vec<(String, Bytes)> + Send + 'static,
+) -> Body {
+	let decoder = EventStreamCodec::with_max_size(buffer_limit);
+	let encoder = BytesCodec::new();
+
+	transform_parser(b, decoder, encoder, move |event| {
+		let TransformEvent::Item(msg) = event else {
+			return Vec::new();
+		};
+		f(msg)
+			.into_iter()
+			.map(|(event_name, payload)| crate::parse::encode_sse_event(&event_name, payload))
+			.collect::<Vec<_>>()
+	})
+}
+
 pub fn inspect(b: Body, buffer_limit: usize, mut f: impl FnMut(Message) + Send + 'static) -> Body {
 	// Safety: each original data chunk is returned unchanged and  in order.
 	b.dangerous_wrap_stream_preserving_content(|b| {

@@ -1889,12 +1889,27 @@ message AIBackend {
     optional string guardrail_identifier = 3;
     optional string guardrail_version = 4;
     BedrockEndpointPreference endpoint_preference = 5;
+    // Chat transport for Anthropic Messages models. CONVERSE (default)
+    // keeps the historical Converse/ConverseStream translation;
+    // NATIVE_MESSAGES serves Messages traffic through Runtime
+    // InvokeModel/InvokeModelWithResponseStream with the Anthropic body
+    // passed through natively (required for Tool Search and client
+    // cache_control TTLs).
+    BedrockTransport transport = 6;
   }
   enum BedrockEndpointPreference {
     BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_PREFERRED = 0;
     BEDROCK_ENDPOINT_PREFERENCE_MANTLE_ONLY = 1;
     BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_ONLY = 2;
     BEDROCK_ENDPOINT_PREFERENCE_MANTLE_PREFERRED = 3;
+  }
+  enum BedrockTransport {
+    BEDROCK_TRANSPORT_CONVERSE = 0;
+    BEDROCK_TRANSPORT_NATIVE_MESSAGES = 1;
+    // OpenAI Chat Completions body over Runtime InvokeModel /
+    // InvokeModelWithResponseStream — for OpenWeight models whose Converse
+    // surface is deficient (e.g. Kimi K3.1). Runtime-only, never Converse.
+    BEDROCK_TRANSPORT_OPENAI_INVOKE = 2;
   }
   message AzureOpenAI {
     optional string model = 1;

@@ -14,6 +14,14 @@ use crate::types::{bedrock, messages, responses};
 #[path = "bedrock_tests.rs"]
 mod tests;
 
+/// Native Anthropic Messages transport for Bedrock Runtime
+/// (`InvokeModel` / `InvokeModelWithResponseStream`), enabled per backend
+/// via `BedrockTransport::NativeMessages`. See the module docs for the
+/// passthrough guarantees (Tool Search shapes, exact tool names, client
+/// `cache_control` TTLs) and the accounting-hint contract.
+#[path = "bedrock_native.rs"]
+pub mod from_messages_native;
+
 /// Bedrock Converse `toolSpec.name` length limit.
 pub const BEDROCK_TOOL_NAME_MAX_LEN: usize = 64;
 
@@ -307,12 +315,36 @@ fn invalid_request_error(bytes: &[u8]) -> Result<bytes::Bytes, AIError> {
 
 impl From<bedrock::TokenUsage> for super::ProviderUsage {
 	fn from(u: bedrock::TokenUsage) -> Self {
+		let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+			cache_ttl_split(u.cache_details.as_deref());
 		Self {
 			input_tokens: u.input_tokens as u64,
 			total_tokens: u.total_tokens as u64,
+			cache_creation_5m_input_tokens,
+			cache_creation_1h_input_tokens,
 			..Default::default()
 		}
 	}
+}
+
+/// Per-TTL cache-write split from AWS `TokenUsage.cacheDetails` (sorted 1h
+/// before 5m; empty/absent = aggregate only). Unknown TTL classes are
+/// counted under NEITHER canonical class — the aggregate attribute still
+/// carries them, and the accounting consumer fails closed on ambiguous
+/// meters rather than approximating.
+pub(crate) fn cache_ttl_split(
+	details: Option<&[bedrock::CacheDetail]>,
+) -> (Option<u64>, Option<u64>) {
+	let mut five_m = None;
+	let mut one_h = None;
+	for detail in details.unwrap_or(&[]) {
+		match detail.ttl {
+			bedrock::CacheTtl::FiveMinutes => five_m = Some(detail.input_tokens as u64),
+			bedrock::CacheTtl::OneHour => one_h = Some(detail.input_tokens as u64),
+			bedrock::CacheTtl::Unknown => {},
+		}
+	}
+	(five_m, one_h)
 }
 
 pub mod from_rerank {
@@ -1191,7 +1223,7 @@ pub mod from_completions {
 	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<bedrock::ConverseResponse>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let provider_usage = resp.usage.map(super::super::ProviderUsage::from);
+		let provider_usage = resp.usage.clone().map(super::super::ProviderUsage::from);
 		let openai = translate_response_internal(resp, model, tool_name_map)?;
 		let passthrough = json::convert::<_, types::completions::Response>(&openai)
 			.map_err(AIError::ResponseParsing)?;
@@ -1428,6 +1460,8 @@ pub mod from_completions {
 				},
 				bedrock::ConverseStreamOutput::Metadata(metadata) => {
 					if let Some(usage) = metadata.usage {
+						let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+							super::cache_ttl_split(usage.cache_details.as_deref());
 						log.update(|r| {
 							r.response.output_tokens = Some(usage.output_tokens as u64);
 							r.response.input_tokens = Some(usage.input_tokens as u64);
@@ -1435,6 +1469,8 @@ pub mod from_completions {
 							r.response.cached_input_tokens = usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								usage.cache_write_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+							r.response.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 							if let Some(completion) = completion.take() {
 								r.response.completion = Some(vec![completion]);
 							}
@@ -2010,7 +2046,7 @@ pub mod from_messages {
 	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<bedrock::ConverseResponse>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let provider_usage = resp.usage.map(super::super::ProviderUsage::from);
+		let provider_usage = resp.usage.clone().map(super::super::ProviderUsage::from);
 		let openai = translate_response_internal(resp, model, tool_name_map)?;
 		let passthrough =
 			json::convert::<_, types::messages::Response>(&openai).map_err(AIError::ResponseParsing)?;
@@ -2096,6 +2132,7 @@ pub mod from_messages {
 								cache_creation_input_tokens: None,
 								cache_read_input_tokens: None,
 								service_tier: None,
+								cache_creation: None,
 							},
 							input_audio_tokens: None,
 							output_audio_tokens: None,
@@ -2250,7 +2287,9 @@ pub mod from_messages {
 				},
 				bedrock::ConverseStreamOutput::Metadata(meta) => {
 					if let Some(usage) = meta.usage {
-						pending_usage = Some(usage);
+						pending_usage = Some(usage.clone());
+						let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+							super::cache_ttl_split(usage.cache_details.as_deref());
 						log.update(|r| {
 							r.response.output_tokens = Some(usage.output_tokens as u64);
 							r.response.input_tokens = Some(usage.input_tokens as u64);
@@ -2258,6 +2297,8 @@ pub mod from_messages {
 							r.response.cached_input_tokens = usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								usage.cache_write_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+							r.response.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 							if let Some(c) = completion.take() {
 								r.response.completion = Some(vec![c]);
 							}
@@ -2324,6 +2365,9 @@ pub mod from_messages {
 			output_tokens: Some(usage.output_tokens),
 			cache_creation_input_tokens: usage.cache_write_input_tokens,
 			cache_read_input_tokens: usage.cache_read_input_tokens,
+			// Translated client wire stays as-shipped: the Bedrock split is
+			// carried by the native telemetry path, not synthesized here.
+			cache_creation: None,
 		}
 	}
 }
@@ -3143,7 +3187,7 @@ pub mod from_responses {
 	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<bedrock::ConverseResponse>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let provider_usage = resp.usage.map(super::super::ProviderUsage::from);
+		let provider_usage = resp.usage.clone().map(super::super::ProviderUsage::from);
 		let adapter = super::ConverseResponseAdapter::from_response(resp, model)?;
 		let mut typed = adapter.to_responses_typed(tool_name_map);
 		if let Some(namespaces) = namespaces {
@@ -3471,7 +3515,9 @@ pub mod from_responses {
 				},
 				bedrock::ConverseStreamOutput::Metadata(meta) => {
 					if let Some(usage) = meta.usage {
-						pending_usage = Some(usage);
+						pending_usage = Some(usage.clone());
+						let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+							super::cache_ttl_split(usage.cache_details.as_deref());
 						log.update(|r| {
 							r.response.output_tokens = Some(usage.output_tokens as u64);
 							r.response.input_tokens = Some(usage.input_tokens as u64);
@@ -3479,6 +3525,8 @@ pub mod from_responses {
 							r.response.cached_input_tokens = usage.cache_read_input_tokens.map(|i| i as u64);
 							r.response.cache_creation_input_tokens =
 								usage.cache_write_input_tokens.map(|i| i as u64);
+							r.response.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+							r.response.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 						});
 					}
 
@@ -3885,6 +3933,119 @@ mod helpers {
 		extract_beta_headers_with_allowed(headers, &ALLOWED_BETA_HEADERS)
 	}
 
+	/// Collect every client `anthropic-beta` value without filtering
+	/// (comma-split across repeated headers, order-preserving,
+	/// de-duplicated). Used by the native Messages transport, which forwards
+	/// the client's beta set verbatim by default.
+	pub fn extract_beta_headers_raw(headers: &http::HeaderMap) -> Vec<String> {
+		let mut out = Vec::new();
+		for value in headers.get_all("anthropic-beta") {
+			let Ok(header_str) = value.to_str() else {
+				continue;
+			};
+			for feature in header_str.split(',') {
+				let trimmed = feature.trim();
+				if !trimmed.is_empty() && !out.iter().any(|v| v == trimmed) {
+					out.push(trimmed.to_string());
+				}
+			}
+		}
+		out
+	}
+
+	/// Beta values removed from the Bedrock-bound native request without any
+	/// loss of served capability:
+	/// - `advanced-tool-use-2025-11-20` gates, on the Anthropic API, exactly
+	///   the capabilities Bedrock Runtime `InvokeModel` serves natively with
+	///   NO beta — the versioned Tool Search server tools
+	///   (`tool_search_tool_regex_20251119` / `tool_search_tool_bm25_20251119`),
+	///   `tool_reference` blocks and `defer_loading` — verified live on Stage
+	///   2026-11-03 (genuine `server_tool_use` chains, no beta header).
+	/// - `claude-code-20250219` is a client-identification hint with no
+	///   request-shape semantics; the Converse transport has silently dropped
+	///   it for weeks with zero client impact.
+	const LOSSLESS_DROPPABLE_BETAS: &[&str] =
+		&["advanced-tool-use-2025-11-20", "claude-code-20250219"];
+
+	/// Beta values recognized as gating capabilities the native Bedrock
+	/// Messages transport cannot serve. Requests carrying them are rejected
+	/// with a typed error before any AWS invocation — never silently
+	/// degraded, never forwarded to an opaque upstream 400.
+	const UNSUPPORTED_REQUIRED_BETAS: &[&str] = &[
+		// Anthropic-API SSE event granularity; the native transport passes
+		// Bedrock events through verbatim and cannot synthesize it.
+		"fine-grained-tool-streaming-2025-05-14",
+	];
+
+	/// Beta resolution outcome for the native Bedrock Messages transport.
+	#[derive(Debug, Default)]
+	pub struct NativeBedrockBetaResolution {
+		/// Values forwarded in the body-level `anthropic_beta` field.
+		pub kept: Vec<String>,
+		/// Values removed without loss (natively served / client hints).
+		pub dropped_lossless: Vec<String>,
+		/// Unrecognized values removed conservatively. Bedrock `InvokeModel`
+		/// rejects every undocumented body-level `anthropic_beta` value
+		/// outright, and the Converse transport has never forwarded any
+		/// client beta — these clients already operate without them.
+		pub dropped_unknown: Vec<String>,
+	}
+
+	/// Resolve client `anthropic-beta` values for the native Bedrock
+	/// transport. Classification per value:
+	/// 1. documented for Bedrock (the
+	///    `AGENTGATEWAY_BEDROCK_ANTHROPIC_BETA_HEADERS` expansion, default =
+	///    the AWS-documented list) → kept;
+	/// 2. [`LOSSLESS_DROPPABLE_BETAS`] → dropped without loss;
+	/// 3. [`UNSUPPORTED_REQUIRED_BETAS`] → `Err` naming the values (typed
+	///    fail-closed rejection);
+	/// 4. anything else → dropped conservatively, surfaced via
+	///    `dropped_unknown` for observability.
+	///
+	/// Replaces the pre-2026-11-03 verbatim forwarding: Bedrock `InvokeModel`
+	/// rejects every undocumented body-level `anthropic_beta` value (observed
+	/// in Production 2026-11-03: `advanced-tool-use-2025-11-20`), so verbatim
+	/// forwarding turned every beta-bearing Claude Code request into an
+	/// upstream 400.
+	pub fn native_bedrock_beta_resolution(
+		values: Vec<String>,
+	) -> Result<NativeBedrockBetaResolution, Vec<String>> {
+		native_bedrock_beta_resolution_with(values, &ALLOWED_BETA_HEADERS)
+	}
+
+	/// Pure core of [`native_bedrock_beta_resolution`], injectable for tests.
+	pub fn native_bedrock_beta_resolution_with(
+		values: Vec<String>,
+		allowed: &[String],
+	) -> Result<NativeBedrockBetaResolution, Vec<String>> {
+		let mut resolution = NativeBedrockBetaResolution::default();
+		let mut unsupported = Vec::new();
+		for value in values {
+			if allowed.contains(&value) {
+				resolution.kept.push(value);
+			} else if LOSSLESS_DROPPABLE_BETAS.contains(&value.as_str()) {
+				resolution.dropped_lossless.push(value);
+			} else if value.starts_with("tool-search-tool") || value.starts_with("advanced-tool-use") {
+				// Guard (preserved from the pre-2026-11-03 refusal arm): a
+				// Tool Search beta that is neither allow-listed nor
+				// stage-proven droppable is refused — a Tool Search request
+				// must never be silently degraded. New Tool Search beta
+				// versions must be proven on Stage before joining
+				// LOSSLESS_DROPPABLE_BETAS.
+				unsupported.push(value);
+			} else if UNSUPPORTED_REQUIRED_BETAS.contains(&value.as_str()) {
+				unsupported.push(value);
+			} else {
+				resolution.dropped_unknown.push(value);
+			}
+		}
+		if unsupported.is_empty() {
+			Ok(resolution)
+		} else {
+			Err(unsupported)
+		}
+	}
+
 	pub fn extract_beta_headers_with_allowed(
 		headers: &http::HeaderMap,
 		allowed_beta_headers: &[String],
@@ -4072,6 +4233,7 @@ impl ConverseResponseAdapter {
 
 		let usage = self
 			.usage
+			.clone()
 			.map(|token_usage| {
 				let input_tokens = token_usage.input_tokens
 					+ token_usage.cache_read_input_tokens.unwrap_or_default()
@@ -4237,7 +4399,7 @@ impl ConverseResponseAdapter {
 		};
 
 		// Build usage
-		let usage = self.usage.map(|u| {
+		let usage = self.usage.clone().map(|u| {
 			let input_tokens = u.input_tokens
 				+ u.cache_read_input_tokens.unwrap_or_default()
 				+ u.cache_write_input_tokens.unwrap_or_default();
@@ -4328,12 +4490,14 @@ impl ConverseResponseAdapter {
 
 		let usage = self
 			.usage
+			.clone()
 			.map(|u| messagest::Usage {
 				input_tokens: u.input_tokens,
 				output_tokens: u.output_tokens,
 				cache_creation_input_tokens: u.cache_write_input_tokens,
 				cache_read_input_tokens: u.cache_read_input_tokens,
 				service_tier: None,
+				cache_creation: None,
 			})
 			.unwrap_or(messagest::Usage {
 				input_tokens: 0,
@@ -4341,6 +4505,7 @@ impl ConverseResponseAdapter {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier: None,
+				cache_creation: None,
 			});
 
 		Ok(messagest::MessagesResponse {

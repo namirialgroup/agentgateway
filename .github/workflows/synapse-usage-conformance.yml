@@ -68,3 +68,68 @@ jobs:
             /tmp/agw-gate-tier1.log
             /tmp/agw-gate-tier2.log
           if-no-files-found: ignore
+
+  telemetry-contract:
+    # Explicit cache-write TTL telemetry contract. The snapshot-based
+    # usage-conformance gate cannot catch a lineage that DELETES the 5m/1h
+    # cache-write split (tsguard2, 2026-10-20): its snapshots were refreshed
+    # to the collapsed behavior and the telemetry tests were deleted with the
+    # feature, so everything "passed". This job fails when the OTLP attribute
+    # names, their registered tests, or their behavior disappear from a
+    # candidate. Runs on the same promotion-gated refs as the conformance job.
+    name: ttl-telemetry-contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout candidate (gate included)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.candidate_ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ttl-telemetry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ttl-telemetry-${{ runner.os }}-
+
+      - name: Source contract — OTLP attribute names must exist
+        run: |
+          set -euo pipefail
+          LOG=crates/agentgateway/src/telemetry/log.rs
+          for attr in \
+            "gen_ai.usage.cache_creation.input_tokens.5m" \
+            "gen_ai.usage.cache_creation.input_tokens.1h"; do
+            grep -qF "$attr" "$LOG" || {
+              echo "CONTRACT VIOLATION: OTLP attribute '$attr' absent from $LOG (cache-write TTL split telemetry deleted?)"
+              exit 1
+            }
+          done
+
+      - name: Registration contract — TTL telemetry tests must be registered
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cargo test -p agentgateway --lib telemetry:: -- --list > /tmp/ttl-contract-list.txt
+          for t in \
+            telemetry::log::tests::llm_span_emits_cache_write_ttl_split_attributes \
+            telemetry::log::tests::llm_span_uses_cache_inclusive_input_tokens; do
+            grep -qF "$t: test" /tmp/ttl-contract-list.txt || {
+              echo "CONTRACT VIOLATION: '$t' is not a registered test (attribute or #[test] lost?)"
+              exit 1
+            }
+            n=$(grep -cF "$t: test" /tmp/ttl-contract-list.txt)
+            [ "$n" -eq 1 ] || {
+              echo "CONTRACT VIOLATION: '$t' registered $n times (duplicate #[test]?)"
+              exit 1
+            }
+          done
+
+      - name: Behavior contract — TTL telemetry tests must pass
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cargo test -p agentgateway --lib telemetry::
+          cargo test -p agent-llm --lib ttl

@@ -723,11 +723,21 @@ func translateModelLLMProvider(ctx RouteContext, namespace string, model *agentg
 			guardrailIdentifier = new(llm.Bedrock.Guardrail.GuardrailIdentifier)
 			guardrailVersion = new(llm.Bedrock.Guardrail.GuardrailVersion)
 		}
+		// Unset resolves to CONVERSE: the fail-closed default transport, matching
+		// the backend provider translation in pkg/syncer/backend.
+		transport := api.AIBackend_BEDROCK_TRANSPORT_CONVERSE
+		switch llm.Bedrock.Transport {
+		case agentgateway.BedrockTransportNativeMessages:
+			transport = api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES
+		case agentgateway.BedrockTransportOpenAIInvoke:
+			transport = api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE
+		}
 		provider.Provider = &api.AIBackend_Provider_Bedrock{Bedrock: &api.AIBackend_Bedrock{
 			Model:               providerModel(selectedModel, llm.Bedrock.Model),
 			Region:              ptr.NonEmptyOrDefault(llm.Bedrock.Region, "us-east-1"),
 			GuardrailIdentifier: guardrailIdentifier,
 			GuardrailVersion:    guardrailVersion,
+			Transport:           transport,
 		}}
 	case llm.Custom != nil:
 		formats, err := plugins.TranslateCustomProviderFormats(llm.Custom.Formats)

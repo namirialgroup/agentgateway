@@ -18,6 +18,41 @@ pub enum BedrockEndpointPreference {
 	RuntimeOnly,
 }
 
+/// Chat transport for Anthropic Messages models on a Bedrock backend.
+///
+/// `Converse` (default) keeps the historical AWS Converse/ConverseStream
+/// translation. `NativeMessages` serves `/v1/messages` traffic through
+/// Bedrock Runtime `InvokeModel`/`InvokeModelWithResponseStream` with the
+/// Anthropic Messages body passed through natively (including Tool Search
+/// server tools, `defer_loading`, `tool_reference` blocks and client
+/// `cache_control` TTLs, none of which Converse can represent). Runtime-only:
+/// Mantle is a different service with different semantics and is never
+/// selected by this transport.
+#[apply(schema_enum!)]
+#[derive(Default)]
+pub enum BedrockTransport {
+	#[default]
+	Converse,
+	NativeMessages,
+	/// OpenAI-compatible `InvokeModel`/`InvokeModelWithResponseStream`:
+	/// the Runtime surface accepts the full OpenAI Chat Completions envelope
+	/// (`temperature`, `reasoning_effort`, tools) and reports per-class token
+	/// details — the transport for OpenWeight models whose Converse surface
+	/// cannot serve them (first target: Moonshot Kimi K3.1). Runtime-only;
+	/// never resolves onto Mantle, never falls back to Converse.
+	OpenAIInvoke,
+}
+
+impl BedrockTransport {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			BedrockTransport::Converse => "converse",
+			BedrockTransport::NativeMessages => "native-messages",
+			BedrockTransport::OpenAIInvoke => "openai-invoke",
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BedrockEndpoint {
 	Runtime,
@@ -44,6 +79,10 @@ pub struct Provider {
 	/// Which endpoint to prefer (Runtime vs Mantle).
 	#[serde(default)]
 	pub endpoint_preference: BedrockEndpointPreference,
+	/// Chat transport for Anthropic Messages models (`converse` by default;
+	/// `native-messages` routes Messages traffic through Runtime InvokeModel).
+	#[serde(default)]
+	pub transport: BedrockTransport,
 }
 
 impl super::Provider for Provider {
@@ -87,6 +126,15 @@ impl Provider {
 		use BedrockEndpoint::{Mantle, Runtime};
 		use BedrockEndpointPreference::*;
 
+		// The InvokeModel transports (native Messages, OpenAIInvoke) are
+		// defined against Bedrock Runtime InvokeModel APIs only. Never resolve
+		// them onto Mantle, whatever the endpoint preference says — a
+		// misconfigured combination must stay on the documented Runtime
+		// surface rather than silently changing service.
+		if self.transport != BedrockTransport::Converse {
+			return Runtime;
+		}
+
 		use crate::model_catalog::tags;
 		let has = |tag| model_id.is_some_and(|m| catalog.is_some_and(|c| c.model_has_tag(m, tag)));
 		match self.endpoint_preference {
@@ -128,6 +176,23 @@ impl Provider {
 		];
 		match self.chat_endpoint(Some(request_model), catalog) {
 			// all chat runtime models seem to support converse
+			BedrockEndpoint::Runtime if self.transport == BedrockTransport::NativeMessages => {
+				// Native Messages transport: Anthropic Messages requests pass
+				// through natively over Runtime InvokeModel; OpenAI Responses
+				// input still falls back to Converse (the translation table
+				// has no Responses→Messages conversion, and failing closed to
+				// the proven Converse translation beats advertising a gap).
+				vec![ChatFormat::AnthropicMessages, ChatFormat::BedrockConverse]
+			},
+			BedrockEndpoint::Runtime if self.transport == BedrockTransport::OpenAIInvoke => {
+				// OpenAIInvoke transport: the ONLY upstream surface is the
+				// OpenAI Chat Completions body over Runtime InvokeModel.
+				// Every client format (Completions, Messages, Responses) is
+				// served THROUGH the OpenAI-completions translation matrix —
+				// advertising BedrockConverse here would silently downgrade a
+				// configured OpenAIInvoke backend to Converse (fail-open).
+				vec![ChatFormat::OpenAICompletions]
+			},
 			BedrockEndpoint::Runtime => vec![ChatFormat::BedrockConverse],
 			BedrockEndpoint::Mantle => {
 				// Short circuit tag checks as we should just use the message endpoint
@@ -181,6 +246,32 @@ impl Provider {
 			super::RouteType::Embeddings => strng::format!("/model/{model}/invoke"),
 			// Rerank uses the agent-runtime Rerank action (model goes in the body as an ARN).
 			super::RouteType::Rerank => strng::literal!("/rerank"),
+			// Native Messages transport: Anthropic Messages chat rides the
+			// Runtime InvokeModel APIs. `upstream_route_type` is derived from
+			// the selected chat translation, so RouteType::Messages here
+			// guarantees the rendered body is the native Anthropic Messages
+			// payload (never a Converse body).
+			super::RouteType::Messages if self.transport == BedrockTransport::NativeMessages => {
+				if streaming {
+					strng::format!("/model/{model}/invoke-with-response-stream")
+				} else {
+					strng::format!("/model/{model}/invoke")
+				}
+			},
+			// OpenAIInvoke transport: chat rides the Runtime InvokeModel APIs
+			// with the OpenAI Chat Completions body (upstream_route_type is
+			// RouteType::Completions, derived from the OpenAICompletions chat
+			// translation; Messages is kept in the guard for defensive
+			// symmetry). No converse path may ever be selected.
+			super::RouteType::Completions | super::RouteType::Messages
+				if self.transport == BedrockTransport::OpenAIInvoke =>
+			{
+				if streaming {
+					strng::format!("/model/{model}/invoke-with-response-stream")
+				} else {
+					strng::format!("/model/{model}/invoke")
+				}
+			},
 			_ if streaming => strng::format!("/model/{model}/converse-stream"),
 			_ => strng::format!("/model/{model}/converse"),
 		}
@@ -212,7 +303,14 @@ mod tests {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: pref,
+			transport: BedrockTransport::Converse,
 		}
+	}
+
+	fn native_provider(pref: BedrockEndpointPreference) -> Provider {
+		let mut p = provider(pref);
+		p.transport = BedrockTransport::NativeMessages;
+		p
 	}
 
 	#[test]
@@ -523,6 +621,144 @@ mod tests {
 				.as_str(),
 			"/model/m/invoke"
 		);
+	}
+
+	#[test]
+	fn transport_defaults_to_converse_and_serializes_stable_names() {
+		// Default must remain Converse: an unmodified backend config keeps the
+		// proven production path (fail-closed rollout contract).
+		let p = Provider {
+			model_override: None,
+			region: strng::new("eu-west-1"),
+			guardrail_identifier: None,
+			guardrail_version: None,
+			endpoint_preference: BedrockEndpointPreference::RuntimePreferred,
+			transport: BedrockTransport::default(),
+		};
+		assert_eq!(p.transport, BedrockTransport::Converse);
+	}
+
+	#[test]
+	fn native_transport_forces_runtime_and_serves_messages_format() {
+		// NativeMessages is Runtime-only: even MantlePreferred/MantleOnly
+		// must resolve chat to Runtime (fail-closed, documented surface).
+		for pref in [
+			BedrockEndpointPreference::RuntimePreferred,
+			BedrockEndpointPreference::MantlePreferred,
+			BedrockEndpointPreference::MantleOnly,
+		] {
+			let p = native_provider(pref);
+			assert_eq!(
+				p.resolve_endpoint(
+					RouteType::Messages,
+					Some("global.anthropic.claude-opus-5-5"),
+					None
+				),
+				BedrockEndpoint::Runtime,
+				"native transport must stay on Runtime under {pref:?}"
+			);
+		}
+		let p = native_provider(BedrockEndpointPreference::RuntimePreferred);
+		assert_eq!(
+			p.supported_chat_formats("global.anthropic.claude-opus-5-5", None),
+			vec![ChatFormat::AnthropicMessages, ChatFormat::BedrockConverse]
+		);
+	}
+
+	#[test]
+	fn native_transport_uses_invoke_paths_for_messages_only() {
+		let p = native_provider(BedrockEndpointPreference::RuntimePreferred);
+		let ep = BedrockEndpoint::Runtime;
+		assert_eq!(
+			p.get_path_for_route(
+				RouteType::Messages,
+				false,
+				"global.anthropic.claude-opus-5-5",
+				ep
+			)
+			.as_str(),
+			"/model/global.anthropic.claude-opus-5-5/invoke"
+		);
+		assert_eq!(
+			p.get_path_for_route(
+				RouteType::Messages,
+				true,
+				"global.anthropic.claude-opus-5-5",
+				ep
+			)
+			.as_str(),
+			"/model/global.anthropic.claude-opus-5-5/invoke-with-response-stream"
+		);
+		// Non-Messages routes keep the historical Converse paths: Responses
+		// input falls back to Converse translation, and embeddings/token-count
+		// keep their dedicated APIs.
+		assert_eq!(
+			p.get_path_for_route(RouteType::Responses, true, "m", ep)
+				.as_str(),
+			"/model/m/converse-stream"
+		);
+		assert_eq!(
+			p.get_path_for_route(RouteType::Completions, false, "m", ep)
+				.as_str(),
+			"/model/m/converse"
+		);
+		assert_eq!(
+			p.get_path_for_route(RouteType::Embeddings, false, "m", ep)
+				.as_str(),
+			"/model/m/invoke"
+		);
+		assert_eq!(
+			p.get_path_for_route(RouteType::AnthropicTokenCount, false, "m", ep)
+				.as_str(),
+			"/model/m/count-tokens"
+		);
+	}
+
+	#[test]
+	fn converse_transport_keeps_historical_paths_and_formats() {
+		// Regression guard: the Converse default must be byte-identical to the
+		// pre-native-transport behavior.
+		let p = provider(BedrockEndpointPreference::RuntimePreferred);
+		let ep = BedrockEndpoint::Runtime;
+		assert_eq!(
+			p.get_path_for_route(RouteType::Messages, false, "m", ep)
+				.as_str(),
+			"/model/m/converse"
+		);
+		assert_eq!(
+			p.get_path_for_route(RouteType::Messages, true, "m", ep)
+				.as_str(),
+			"/model/m/converse-stream"
+		);
+		assert_eq!(
+			p.supported_chat_formats("any", None),
+			vec![ChatFormat::BedrockConverse]
+		);
+		// Mantle resolution is untouched by the transport field when Converse.
+		let mantle = provider(BedrockEndpointPreference::MantleOnly);
+		assert_eq!(
+			mantle.resolve_endpoint(RouteType::Messages, Some("m"), None),
+			BedrockEndpoint::Mantle
+		);
+	}
+
+	#[test]
+	fn native_transport_serializes_from_config_value() {
+		// serde round-trip of the backend config value. The schema_enum!
+		// convention camel-cases variant names ("nativeMessages"), matching
+		// how BedrockEndpointPreference serializes; the K8s CRD surface
+		// exposes the PascalCase "NativeMessages" via the controller types
+		// and the telemetry attribute uses the kebab "native-messages".
+		let native: Provider =
+			serde_json::from_str(r#"{"region":"eu-west-1","transport":"nativeMessages"}"#)
+				.expect("nativeMessages config must deserialize");
+		assert_eq!(native.transport, BedrockTransport::NativeMessages);
+		let implicit: Provider =
+			serde_json::from_str(r#"{"region":"eu-west-1"}"#).expect("missing transport must default");
+		assert_eq!(implicit.transport, BedrockTransport::Converse);
+		// Wire-name assertions (telemetry attribute contract).
+		assert_eq!(BedrockTransport::Converse.as_str(), "converse");
+		assert_eq!(BedrockTransport::NativeMessages.as_str(), "native-messages");
 	}
 
 	#[test]

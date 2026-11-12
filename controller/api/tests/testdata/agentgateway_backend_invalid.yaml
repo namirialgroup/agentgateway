@@ -338,3 +338,15 @@ spec:
           guardrail:
             identifier: test-guardrail
             version: "1"
+---
+_err: Unsupported value
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-backend-unknown-transport
+spec:
+  ai:
+    provider:
+      bedrock:
+        region: eu-west-1
+        transport: SomewhereElse

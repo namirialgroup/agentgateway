@@ -257,6 +257,35 @@ pub struct LLMRequest {
 	pub prompt: Option<Arc<Vec<SimpleChatCompletionMessage>>>,
 	#[serde(skip)]
 	pub provider_state: Option<ProviderState>,
+	/// Claude Code safeguards review plan, set only when this attempt classifies
+	/// the response locally (non-native leg). Never logged or serialized.
+	#[serde(skip)]
+	pub safeguards: Option<Arc<types::safeguards::SafeguardsReviewPlan>>,
+	/// Transport/hints set by the request renderer for the selected upstream
+	/// wire format. Never logged or serialized beyond the telemetry
+	/// attribute derived from it.
+	#[serde(skip)]
+	pub transport_hints: TransportHints,
+}
+
+/// Request-render facts that downstream accounting/telemetry need but that
+/// are not part of the client wire contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportHints {
+	/// The upstream is the Bedrock Runtime native Anthropic Messages
+	/// transport (`InvokeModel`/`InvokeModelWithResponseStream`) — used for
+	/// the `gen_ai.provider.transport` telemetry attribute.
+	pub bedrock_native_messages: bool,
+	/// The upstream is the Bedrock Runtime OpenAIInvoke transport
+	/// (`InvokeModel`/`InvokeModelWithResponseStream` with an OpenAI Chat
+	/// Completions body) — used for the `gen_ai.provider.transport`
+	/// telemetry attribute.
+	pub bedrock_openai_invoke: bool,
+	/// The request carried at least one `cache_control` with `ttl: "1h"`.
+	/// Together with the provider-reported cache-write aggregate this makes
+	/// the 5m/1h attribution provable or explicitly ambiguous (never
+	/// guessed) on the native transport.
+	pub cache_1h_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +423,17 @@ pub struct LLMResponse {
 	pub reasoning_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cache_creation_input_tokens: Option<u64>,
+	/// Cache-write tokens with a 5-minute TTL class, when the provider
+	/// reported the per-class split (Bedrock `cacheDetails[ttl=5m]`, Anthropic
+	/// `usage.cache_creation.ephemeral_5m_input_tokens`). `None` = no split
+	/// reported — consumers must fail closed on ambiguous aggregates rather
+	/// than approximate the class.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_5m_input_tokens: Option<u64>,
+	/// Cache-write tokens with a 1-hour TTL class, when the provider reported
+	/// the per-class split.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_1h_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cached_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]

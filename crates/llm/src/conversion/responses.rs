@@ -735,7 +735,9 @@ pub mod from_messages {
 			input_tokens: u.input_tokens as u64,
 			total_tokens: u.total_tokens as u64,
 			reasoning_tokens: Some(u.output_tokens_details.reasoning_tokens as u64),
+			..Default::default()
 		});
+
 		let anthropic = translate_response_internal(resp)?;
 		Ok(Box::new(super::super::ResponseWithProviderUsage {
 			response: anthropic,
@@ -935,6 +937,7 @@ pub mod from_messages {
 							cache_creation_input_tokens: None,
 							cache_read_input_tokens: None,
 							service_tier: None,
+							cache_creation: None,
 						},
 						input_audio_tokens: None,
 						output_audio_tokens: None,
@@ -1614,6 +1617,7 @@ pub mod from_messages {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier,
+				cache_creation: None,
 			};
 		};
 		let cache_creation_input_tokens = usage
@@ -1632,6 +1636,7 @@ pub mod from_messages {
 			cache_creation_input_tokens,
 			cache_read_input_tokens,
 			service_tier,
+			cache_creation: None,
 		}
 	}
 
@@ -1644,6 +1649,7 @@ pub mod from_messages {
 			output_tokens: Some(usage.output_tokens),
 			cache_creation_input_tokens: usage.cache_creation_input_tokens,
 			cache_read_input_tokens: usage.cache_read_input_tokens,
+			cache_creation: None,
 		}
 	}
 

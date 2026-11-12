@@ -571,6 +571,17 @@ type BedrockSettings struct {
 	// `mantle` and `runtime`.
 	// +optional
 	EndpointPreference BedrockEndpointPreference `json:"endpointPreference,omitempty"`
+
+	// Transport selects the chat transport for Anthropic Messages models.
+	// `Converse` (default) keeps the historical Converse/ConverseStream
+	// translation. `NativeMessages` serves /v1/messages traffic through
+	// Bedrock Runtime InvokeModel/InvokeModelWithResponseStream with the
+	// Anthropic body passed through natively — required for Anthropic Tool
+	// Search (server-side discovery is only available on those APIs) and to
+	// honor client cache_control TTLs. Runtime-only: never resolves to
+	// Mantle.
+	// +optional
+	Transport BedrockTransport `json:"transport,omitempty"`
 }
 
 // BedrockEndpointPreference selects the Bedrock API endpoint preference.
@@ -588,6 +599,26 @@ const (
 	BedrockEndpointPreferenceMantleOnly BedrockEndpointPreference = "MantleOnly"
 	// BedrockEndpointPreferenceRuntimeOnly always uses the Runtime endpoint, regardless of catalog tags.
 	BedrockEndpointPreferenceRuntimeOnly BedrockEndpointPreference = "RuntimeOnly"
+)
+
+// BedrockTransport selects the chat transport for Anthropic Messages models.
+// +k8s:enum
+type BedrockTransport string
+
+const (
+	// BedrockTransportConverse translates Messages requests to AWS
+	// Converse/ConverseStream. This is the default.
+	BedrockTransportConverse BedrockTransport = "Converse"
+	// BedrockTransportNativeMessages passes Anthropic Messages bodies through
+	// natively to Bedrock Runtime InvokeModel/InvokeModelWithResponseStream.
+	BedrockTransportNativeMessages BedrockTransport = "NativeMessages"
+	// BedrockTransportOpenAIInvoke sends the OpenAI Chat Completions body
+	// through Bedrock Runtime InvokeModel/InvokeModelWithResponseStream —
+	// the native surface for OpenWeight models whose Converse API cannot
+	// serve them (e.g. Kimi K3.1: Converse rejects temperature and has no
+	// explicit caching). Runtime-only; the proxy never fails this transport
+	// open to Converse.
+	BedrockTransportOpenAIInvoke BedrockTransport = "OpenAIInvoke"
 )
 
 type BedrockConfig struct {

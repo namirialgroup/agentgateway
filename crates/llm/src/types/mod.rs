@@ -7,6 +7,7 @@ pub mod gemini;
 pub mod messages;
 pub mod rerank;
 pub mod responses;
+pub mod safeguards;
 pub mod vertex;
 pub mod vertex_gemini;
 

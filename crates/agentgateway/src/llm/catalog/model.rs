@@ -187,6 +187,15 @@ pub struct Rates {
 	/// Cost per 1M tokens written to cache.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cache_write: Option<Money>,
+	/// Cost per 1M tokens written to an extended-TTL (1h) cache checkpoint.
+	/// Falls back to `cache_write` when unset, so catalogs that price all
+	/// writes uniformly need not set it. Anthropic (Bedrock InvokeModel and
+	/// first-party) prices 1h checkpoints above the 5m class — Stage
+	/// 2026-11-02 measured the inline estimate underpricing 1h writes by
+	/// exactly the missing rate delta (6841 tokens × (8µ − 5µ) = $0.020523)
+	/// while this field was absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_write_1h: Option<Money>,
 	/// Cost per 1M reasoning tokens. Falls back to the output rate if unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reasoning: Option<Money>,
@@ -217,6 +226,7 @@ impl Rates {
 			output: pick(&self.output, &delta.output),
 			cache_read: pick(&self.cache_read, &delta.cache_read),
 			cache_write: pick(&self.cache_write, &delta.cache_write),
+			cache_write_1h: pick(&self.cache_write_1h, &delta.cache_write_1h),
 			reasoning: pick(&self.reasoning, &delta.reasoning),
 			input_audio: pick(&self.input_audio, &delta.input_audio),
 			output_audio: pick(&self.output_audio, &delta.output_audio),
@@ -295,6 +305,12 @@ pub struct Usage {
 	pub input: u64,
 	pub cache_read: u64,
 	pub cache_write: u64,
+	/// Subset of `cache_write` written under an extended TTL (1h checkpoint),
+	/// priced at the 1h rate when the catalog carries one. Providers that do
+	/// not report the TTL split leave this at zero; it never exceeds
+	/// `cache_write`.
+	#[serde(default)]
+	pub cache_write_1h: u64,
 	pub output: u64,
 	pub reasoning: u64,
 	pub input_audio: u64,
@@ -345,10 +361,19 @@ impl Rates {
 		let reasoning_rate = self.reasoning.as_ref().or(self.output.as_ref());
 		let input_audio_rate = self.input_audio.as_ref().or(self.input.as_ref());
 		let output_audio_rate = self.output_audio.as_ref().or(self.output.as_ref());
+		// Extended-TTL (1h) cache writes price at their own rate when the
+		// catalog carries one, falling back to the plain cache-write rate so
+		// uniform-pricing catalogs are unchanged. The subcount never exceeds
+		// the aggregate write count.
+		let cache_write_1h = usage.cache_write_1h.min(usage.cache_write);
+		let cache_write_5m = usage.cache_write.saturating_sub(cache_write_1h);
+		let cache_write_1h_rate = self.cache_write_1h.as_ref().or(self.cache_write.as_ref());
 		Breakdown {
 			input: line(usage.input, self.input.as_ref()) / unit,
 			cache_read: line(usage.cache_read, self.cache_read.as_ref()) / unit,
-			cache_write: line(usage.cache_write, self.cache_write.as_ref()) / unit,
+			cache_write: (line(cache_write_5m, self.cache_write.as_ref())
+				+ line(cache_write_1h, cache_write_1h_rate))
+				/ unit,
 			output: line(usage.output, self.output.as_ref()) / unit,
 			reasoning: line(usage.reasoning, reasoning_rate) / unit,
 			input_audio: line(usage.input_audio, input_audio_rate) / unit,
@@ -624,6 +649,7 @@ mod tests {
 				output: Some(m("15")),
 				cache_read: Some(m("0.3")),
 				cache_write: Some(m("3.75")),
+				cache_write_1h: None,
 				reasoning: Some(m("15")),
 				input_audio: Some(m("40")),
 				output_audio: Some(m("80")),
@@ -636,6 +662,7 @@ mod tests {
 			input: 1000,
 			cache_read: 2000,
 			cache_write: 500,
+			cache_write_1h: 0,
 			output: 500,
 			reasoning: 100,
 			input_audio: 50,
@@ -693,6 +720,182 @@ mod tests {
 		};
 		let b = e.breakdown(&u);
 		assert_eq!(b.cache_read, Decimal::ZERO, "no cache rate -> not billed");
+	}
+
+	// Stage-derived regression (F2, 2026-11-02): the Opus Global card prices
+	// 5m cache writes at 5µ/MTok and 1h writes at 8µ/MTok. The inline estimate
+	// priced 1h writes at the 5m rate while `cache_write_1h` was missing.
+	fn stage_rates() -> Rates {
+		Rates {
+			input: Some(m("0.000004")),
+			output: Some(m("0.00002")),
+			cache_read: None,
+			cache_write: Some(m("0.000005")),
+			cache_write_1h: Some(m("0.000008")),
+			reasoning: None,
+			input_audio: None,
+			output_audio: None,
+			per_page: None,
+			unknown: Unknown::new(),
+		}
+	}
+
+	#[test]
+	fn breakdown_prices_1h_writes_at_the_1h_rate() {
+		// s07-write1h live row: 6841 tokens all written under ttl=1h.
+		let e = entry(stage_rates(), vec![]);
+		let u = Usage {
+			input: 1000,
+			cache_write: 6841,
+			cache_write_1h: 6841,
+			output: 100,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(
+			b.cache_write,
+			d("0.000000054728"),
+			"6841 × 8µ/MTok — not the 5m rate"
+		);
+	}
+
+	#[test]
+	fn breakdown_1h_writes_fall_back_to_cache_write_rate() {
+		// Catalogs without a distinct 1h rate keep the pre-F2 arithmetic.
+		let rates = Rates {
+			cache_write_1h: None,
+			..stage_rates()
+		};
+		let e = entry(rates, vec![]);
+		let u = Usage {
+			cache_write: 6841,
+			cache_write_1h: 6841,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(
+			b.cache_write,
+			d("0.000000034205"),
+			"6841 × 5µ/MTok — the documented fallback (and the F2-buggy value)"
+		);
+	}
+
+	#[test]
+	fn breakdown_mixed_ttl_write_split() {
+		// s08a live row shape: new 5m write 20242 + 1h write carried in the
+		// same aggregate.
+		let e = entry(stage_rates(), vec![]);
+		let u = Usage {
+			cache_write: 20242 + 6841,
+			cache_write_1h: 6841,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(
+			b.cache_write,
+			d("0.000000155938"),
+			"20242 × 5µ + 6841 × 8µ per-MTok"
+		);
+	}
+
+	#[test]
+	fn breakdown_1h_subcount_never_exceeds_the_write_total() {
+		let e = entry(stage_rates(), vec![]);
+		let u = Usage {
+			cache_write: 1000,
+			cache_write_1h: 5000,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(
+			b.cache_write,
+			d("0.000000008"),
+			"clamped: 1000 × 8µ/MTok (all treated as 1h, nothing negative)"
+		);
+	}
+
+	#[test]
+	fn breakdown_observed_stage_1h_write_at_effective_card() {
+		// F2 regression on the live Stage row (2026-11-02 P4-ACCT req 3):
+		// input 23 / output 7 / cache writes 6841, all under ttl=1h. The
+		// effective Bedrock global card (4/20/5/8/0.2 $/MTok) prices the 1h
+		// writes at $0.054728 before other usage and the whole request at
+		// $0.054960 — not the pre-fix $0.034437.
+		let e = entry(
+			Rates {
+				input: Some(m("4")),
+				output: Some(m("20")),
+				cache_read: Some(m("0.2")),
+				cache_write: Some(m("5")),
+				cache_write_1h: Some(m("8")),
+				..Default::default()
+			},
+			vec![],
+		);
+		let u = Usage {
+			input: 23,
+			output: 7,
+			cache_write: 6841,
+			cache_write_1h: 6841,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(
+			b.cache_write,
+			d("0.054728"),
+			"6841 × $8/MTok — the 1h class, before other usage charges"
+		);
+		assert_eq!(
+			b.total(),
+			d("0.054960"),
+			"complete request: 23×4µ + 6841×8µ + 7×20µ per-MTok"
+		);
+	}
+
+	#[test]
+	fn breakdown_pre_f2_card_underprices_observed_request_by_exactly_20523() {
+		// Same live row against a card WITHOUT the 1h rate: the documented
+		// fallback prices 1h writes at the 5m rate and reproduces the
+		// observed gateway estimate $0.034437 — underpricing the complete
+		// request by exactly $0.020523 (the F2 defect).
+		let u = Usage {
+			input: 23,
+			output: 7,
+			cache_write: 6841,
+			cache_write_1h: 6841,
+			..Default::default()
+		};
+		let fallback = entry(
+			Rates {
+				input: Some(m("4")),
+				output: Some(m("20")),
+				cache_read: Some(m("0.2")),
+				cache_write: Some(m("5")),
+				..Default::default()
+			},
+			vec![],
+		)
+		.breakdown(&u)
+		.total();
+		let fixed = entry(
+			Rates {
+				input: Some(m("4")),
+				output: Some(m("20")),
+				cache_read: Some(m("0.2")),
+				cache_write: Some(m("5")),
+				cache_write_1h: Some(m("8")),
+				..Default::default()
+			},
+			vec![],
+		)
+		.breakdown(&u)
+		.total();
+		assert_eq!(fallback, d("0.034437"), "observed pre-fix gateway total");
+		assert_eq!(
+			fixed - fallback,
+			d("0.020523"),
+			"observed underpricing = 6841 × (8µ − 5µ)"
+		);
 	}
 
 	#[test]

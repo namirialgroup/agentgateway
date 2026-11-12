@@ -1,0 +1,11 @@
+ai:
+  providerGroups:
+  - providers:
+    - bedrock:
+        model: eu.anthropic.claude-sonnet-5-5
+        region: eu-west-1
+      name: backend
+key: test-ns/bedrock-unknown-transport
+name:
+  name: bedrock-unknown-transport
+  namespace: test-ns

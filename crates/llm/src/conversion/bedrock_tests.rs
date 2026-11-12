@@ -136,6 +136,7 @@ fn test_metadata_from_header() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	// Simulate transformation CEL setting x-bedrock-metadata header
@@ -194,6 +195,7 @@ fn test_output_config_effort_without_thinking_is_passed_through() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::typed::Request {
@@ -248,6 +250,7 @@ fn test_explicit_empty_output_config_is_preserved() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::typed::Request {
@@ -304,6 +307,7 @@ fn test_thinking_and_output_config_are_both_passed_through() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::typed::Request {
@@ -360,6 +364,7 @@ fn test_adaptive_thinking_preserves_sampling_and_tool_choice() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::typed::Request {
@@ -438,6 +443,7 @@ fn test_enabled_thinking_applies_sampling_and_tool_choice_constraints() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::typed::Request {
@@ -504,6 +510,7 @@ fn test_messages_image_url_to_bedrock_returns_error() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::typed::Request {
@@ -551,6 +558,7 @@ fn test_completions_image_data_url_maps_to_converse_image_block() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::completions::Request = serde_json::from_value(json!({
@@ -595,6 +603,7 @@ fn test_completions_image_url_to_bedrock_returns_error() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 	let req: types::completions::Request = serde_json::from_value(json!({
 		"model": "gpt-4o",
@@ -620,6 +629,7 @@ fn test_completions_request_metadata_only_uses_bedrock_header() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = types::completions::typed::Request {
@@ -707,6 +717,7 @@ fn test_completions_json_schema_response_format_maps_to_converse_output_config()
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let schema = json!({
@@ -805,6 +816,7 @@ fn test_completions_reasoning_effort_maps_to_enabled_thinking_budget() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = types::completions::typed::Request {
@@ -882,6 +894,7 @@ fn test_completions_explicit_thinking_budget_forces_enabled_thinking() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = types::completions::typed::Request {
@@ -962,6 +975,7 @@ fn test_responses_request_metadata_only_uses_bedrock_header() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1007,6 +1021,7 @@ fn test_responses_reasoning_effort_maps_to_enabled_thinking_budget() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1043,6 +1058,7 @@ fn test_responses_explicit_thinking_budget_forces_enabled_thinking() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1082,6 +1098,7 @@ fn test_responses_vendor_extension_thinking_budget_forces_enabled_thinking() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1591,6 +1608,7 @@ fn test_messages_long_tool_names_fit_bedrock_tool_config() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::Request {
@@ -1650,6 +1668,7 @@ fn test_messages_long_tool_name_round_trip_response() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req = messages::Request {
@@ -1743,6 +1762,7 @@ fn test_responses_assistant_input_image_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1776,6 +1796,7 @@ fn test_responses_input_image_remote_url_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1809,6 +1830,7 @@ fn test_responses_input_image_non_base64_data_url_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1842,6 +1864,7 @@ fn test_responses_input_image_non_image_data_url_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1875,6 +1898,7 @@ fn test_responses_input_image_empty_media_type_data_url_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1908,6 +1932,7 @@ fn test_responses_input_image_file_id_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1936,6 +1961,7 @@ fn test_responses_system_input_file_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -1970,6 +1996,7 @@ fn test_responses_input_file_id_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -2001,6 +2028,7 @@ fn test_responses_input_file_remote_url_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -2033,6 +2061,7 @@ fn test_responses_input_file_unknown_format_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	};
 
 	let req: types::responses::Request = serde_json::from_value(json!({
@@ -2057,4 +2086,136 @@ fn test_responses_input_file_unknown_format_is_rejected() {
 			.contains("document format could not be determined"),
 		"unexpected error: {err}"
 	);
+}
+
+// --- Cache-write TTL split (AWS TokenUsage.cacheDetails) — P0-A ------------
+
+#[test]
+fn test_token_usage_parses_cache_details_per_ttl_class() {
+	use crate::types::bedrock::{CacheTtl, TokenUsage};
+
+	// Mixed 5m + 1h (the API returns them sorted 1h before 5m).
+	let mixed: TokenUsage = serde_json::from_value(json!({
+		"inputTokens": 100,
+		"outputTokens": 20,
+		"totalTokens": 120,
+		"cacheReadInputTokens": 7,
+		"cacheWriteInputTokens": 300,
+		"cacheDetails": [
+			{ "ttl": "1h", "inputTokens": 100 },
+			{ "ttl": "5m", "inputTokens": 200 }
+		]
+	}))
+	.unwrap();
+	let details = mixed.cache_details.unwrap();
+	assert_eq!(details.len(), 2);
+	assert_eq!(details[0].ttl, CacheTtl::OneHour);
+	assert_eq!(details[0].input_tokens, 100);
+	assert_eq!(details[1].ttl, CacheTtl::FiveMinutes);
+	assert_eq!(details[1].input_tokens, 200);
+
+	// Aggregate-only (older models / no TTL breakdown reported).
+	let aggregate_only: TokenUsage = serde_json::from_value(json!({
+		"inputTokens": 100,
+		"outputTokens": 20,
+		"totalTokens": 120,
+		"cacheWriteInputTokens": 300
+	}))
+	.unwrap();
+	assert!(aggregate_only.cache_details.is_none());
+}
+
+#[test]
+fn test_cache_ttl_split_maps_each_class_and_ignores_unknown() {
+	use crate::types::bedrock::{CacheDetail, CacheTtl, TokenUsage};
+
+	let usage = TokenUsage {
+		input_tokens: 1,
+		output_tokens: 1,
+		total_tokens: 2,
+		cache_read_input_tokens: None,
+		cache_write_input_tokens: Some(300),
+		cache_details: Some(vec![
+			CacheDetail {
+				ttl: CacheTtl::FiveMinutes,
+				input_tokens: 200,
+			},
+			CacheDetail {
+				ttl: CacheTtl::OneHour,
+				input_tokens: 100,
+			},
+			CacheDetail {
+				ttl: CacheTtl::Unknown,
+				input_tokens: 5,
+			},
+		]),
+	};
+	let provider_usage: crate::conversion::ProviderUsage = usage.into();
+	assert_eq!(provider_usage.cache_creation_5m_input_tokens, Some(200));
+	assert_eq!(provider_usage.cache_creation_1h_input_tokens, Some(100));
+
+	// Aggregate-only → split stays None (never guessed, never zero).
+	let aggregate_only = TokenUsage {
+		input_tokens: 1,
+		output_tokens: 1,
+		total_tokens: 2,
+		cache_read_input_tokens: None,
+		cache_write_input_tokens: Some(300),
+		cache_details: None,
+	};
+	let provider_usage: crate::conversion::ProviderUsage = aggregate_only.into();
+	assert_eq!(provider_usage.cache_creation_5m_input_tokens, None);
+	assert_eq!(provider_usage.cache_creation_1h_input_tokens, None);
+}
+
+#[test]
+fn test_converse_response_carries_ttl_split_into_llm_response() {
+	// Buffered messages-format translation (the Anthropic-messages → Bedrock
+	// Converse path): the TTL split must survive into the telemetry response.
+	let model = "eu.anthropic.claude-sonnet-5-5";
+	let bedrock_resp = json!({
+		"output": {
+			"message": {
+				"role": "assistant",
+				"content": [{ "text": "hello" }]
+			}
+		},
+		"stopReason": "end_turn",
+		"usage": {
+			"inputTokens": 1000,
+			"outputTokens": 100,
+			"totalTokens": 1400,
+			"cacheReadInputTokens": 300,
+			"cacheWriteInputTokens": 300,
+			"cacheDetails": [
+				{ "ttl": "1h", "inputTokens": 100 },
+				{ "ttl": "5m", "inputTokens": 200 }
+			]
+		}
+	});
+	let bytes = serde_json::to_vec(&bedrock_resp).unwrap();
+
+	let translated = from_messages::translate_response(&Bytes::from(bytes), model, None).unwrap();
+	let llm = translated.to_llm_response(crate::LogContentFields::default());
+	assert_eq!(llm.cache_creation_input_tokens, Some(300));
+	assert_eq!(llm.cache_creation_5m_input_tokens, Some(200));
+	assert_eq!(llm.cache_creation_1h_input_tokens, Some(100));
+
+	// Aggregate-only response → split stays None on the telemetry response.
+	let aggregate_only = json!({
+		"output": { "message": { "role": "assistant", "content": [{ "text": "hi" }] } },
+		"stopReason": "end_turn",
+		"usage": {
+			"inputTokens": 1000,
+			"outputTokens": 100,
+			"totalTokens": 1300,
+			"cacheWriteInputTokens": 300
+		}
+	});
+	let bytes = serde_json::to_vec(&aggregate_only).unwrap();
+	let translated = from_messages::translate_response(&Bytes::from(bytes), model, None).unwrap();
+	let llm = translated.to_llm_response(crate::LogContentFields::default());
+	assert_eq!(llm.cache_creation_input_tokens, Some(300));
+	assert_eq!(llm.cache_creation_5m_input_tokens, None);
+	assert_eq!(llm.cache_creation_1h_input_tokens, None);
 }

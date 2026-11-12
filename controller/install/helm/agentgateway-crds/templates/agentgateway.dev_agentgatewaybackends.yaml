@@ -246,6 +246,21 @@ spec:
                                     minLength: 1
                                     pattern: ^[a-z0-9-]+$
                                     type: string
+                                  transport:
+                                    description: |-
+                                      Transport selects the chat transport for Anthropic Messages models.
+                                      `Converse` (default) keeps the historical Converse/ConverseStream
+                                      translation. `NativeMessages` serves /v1/messages traffic through
+                                      Bedrock Runtime InvokeModel/InvokeModelWithResponseStream with the
+                                      Anthropic body passed through natively — required for Anthropic Tool
+                                      Search (server-side discovery is only available on those APIs) and to
+                                      honor client cache_control TTLs. Runtime-only: never resolves to
+                                      Mantle.
+                                    enum:
+                                    - Converse
+                                    - NativeMessages
+                                    - OpenAIInvoke
+                                    type: string
                                 type: object
                                 x-kubernetes-validations:
                                 - message: Bedrock guardrails cannot be used with
@@ -7384,6 +7399,21 @@ spec:
                             maxLength: 63
                             minLength: 1
                             pattern: ^[a-z0-9-]+$
+                            type: string
+                          transport:
+                            description: |-
+                              Transport selects the chat transport for Anthropic Messages models.
+                              `Converse` (default) keeps the historical Converse/ConverseStream
+                              translation. `NativeMessages` serves /v1/messages traffic through
+                              Bedrock Runtime InvokeModel/InvokeModelWithResponseStream with the
+                              Anthropic body passed through natively — required for Anthropic Tool
+                              Search (server-side discovery is only available on those APIs) and to
+                              honor client cache_control TTLs. Runtime-only: never resolves to
+                              Mantle.
+                            enum:
+                            - Converse
+                            - NativeMessages
+                            - OpenAIInvoke
                             type: string
                         type: object
                         x-kubernetes-validations:

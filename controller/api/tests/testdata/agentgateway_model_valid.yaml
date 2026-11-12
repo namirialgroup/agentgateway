@@ -206,3 +206,27 @@ spec:
     guardrail:
       identifier: test-guardrail
       version: "1"
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: bedrock-model-native-transport
+spec:
+  parentRefs:
+  - name: ai-gateway
+  provider: Bedrock
+  bedrock:
+    region: eu-west-1
+    transport: NativeMessages
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: bedrock-model-explicit-converse-transport
+spec:
+  parentRefs:
+  - name: ai-gateway
+  provider: Bedrock
+  bedrock:
+    region: eu-west-1
+    transport: Converse

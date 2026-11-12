@@ -10,8 +10,9 @@ pub use agent_llm::tokenizer::{num_tokens_from_messages, preload_tokenizers};
 pub use agent_llm::{
 	AIError, CacheTokenConvention, ChatFormat, ContentScope, InputFormat, LLMInfo, LLMRequest,
 	LLMRequestParams, LLMResponse, LogContentFields, PromptCachingConfig, Provider, ProviderState,
-	RequestType, ResponseType, RouteType, SimpleChatCompletionMessage, TokenGapSummary, anthropic,
-	conversion, copilot, custom, gemini, logged_response_parsing, openai, types,
+	RequestType, ResponseType, RouteType, SimpleChatCompletionMessage, TokenGapSummary,
+	TransportHints, anthropic, conversion, copilot, custom, gemini, logged_response_parsing, openai,
+	types,
 };
 use axum_extra::headers::authorization::Bearer;
 use headers::{ContentEncoding, HeaderMapExt};
@@ -40,6 +41,8 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
 pub mod catalog;
 pub mod discovery;
 pub mod policy;
+pub mod safeguards;
+pub mod tool_search_policy;
 
 use policy::streaming_guardrails::GuardedSseBody;
 pub use types::{OutputMessage, OutputMessagePart, ToolCall};
@@ -316,6 +319,9 @@ struct ChatTranslation {
 struct RenderedChatRequest {
 	body: Vec<u8>,
 	provider_state: Option<ProviderState>,
+	/// Request-render facts for accounting/telemetry (e.g. the Bedrock
+	/// native Messages transport flags). Empty for every other translation.
+	transport_hints: TransportHints,
 }
 
 // Context provider to each request translation
@@ -349,6 +355,19 @@ struct ChatStreamContext {
 	log_content: LogContentFields,
 	tool_name_map: Option<conversion::bedrock::BedrockToolNameMap>,
 	namespaces: Option<Arc<conversion::namespace_tools::NamespaceToolMap>>,
+	/// The upstream speaks the native Bedrock Runtime Messages transport
+	/// (`InvokeModelWithResponseStream`): the response body is the AWS
+	/// EventStream binary protocol even though the selected chat format is
+	/// AnthropicMessages, so the stream must be transcoded before the
+	/// Anthropic-native passthrough state machine sees it.
+	bedrock_native: bool,
+	/// The upstream speaks the Bedrock Runtime OpenAIInvoke transport
+	/// (`InvokeModelWithResponseStream` with an OpenAI Chat Completions body):
+	/// the response body is the AWS EventStream binary protocol even though
+	/// the selected chat format is OpenAICompletions, so each raw OpenAI
+	/// chunk must be re-framed as OpenAI SSE (with the `[DONE]` terminator)
+	/// before the OpenAI-compat stream translations see it.
+	bedrock_openai_invoke: bool,
 }
 
 /// Ordered chat conversion table.
@@ -429,6 +448,7 @@ fn render_openai_completions(
 	Ok(RenderedChatRequest {
 		body,
 		provider_state,
+		transport_hints: TransportHints::default(),
 	})
 }
 
@@ -544,6 +564,47 @@ fn render_bedrock_converse(
 	Ok(RenderedChatRequest {
 		body: bedrock.body,
 		provider_state,
+		transport_hints: TransportHints::default(),
+	})
+}
+
+/// Render the Anthropic Messages body for a Bedrock backend whose chat
+/// transport is `native-messages` (Runtime `InvokeModel`). The client body
+/// passes through natively — no Converse typed round-trip, no tool-name
+/// remapping, no cachePoint synthesis — with only the Bedrock envelope
+/// (`anthropic_version`, body-level `anthropic_beta`) added.
+fn render_bedrock_native_messages(
+	req: types::ChatRequest,
+	ctx: &ChatRequestContext<'_>,
+) -> Result<RenderedChatRequest, AIError> {
+	let AIProvider::Bedrock(provider) = ctx.provider else {
+		return Err(AIError::UnsupportedConversion(strng::literal!(
+			"expected bedrock provider"
+		)));
+	};
+	let _ = provider;
+	let native =
+		conversion::bedrock::from_messages_native::translate(req, ctx.catalog, Some(ctx.headers))?;
+	if !native.dropped_betas.is_empty() {
+		// Beta NAMES only (never values of other headers): identifies which
+		// client betas the native transport removed — the §8 monitoring
+		// signal for unexpected beta-classes on real traffic.
+		info!(
+			bedrock.native.betas_dropped = ?native.dropped_betas,
+			"removed client anthropic-beta values not forwarded on the native Bedrock transport"
+		);
+	}
+	Ok(RenderedChatRequest {
+		body: native.body,
+		// Deliberately no ProviderState::Bedrock: the tool-name map must not
+		// exist on the native path so response/stream handling never rewrites
+		// tool names or restores them.
+		provider_state: None,
+		transport_hints: TransportHints {
+			bedrock_native_messages: true,
+			bedrock_openai_invoke: false,
+			cache_1h_requested: native.cache_1h_requested,
+		},
 	})
 }
 
@@ -572,8 +633,38 @@ impl ChatTranslation {
 		ctx: &ChatRequestContext<'_>,
 	) -> Result<RenderedChatRequest, AIError> {
 		let body = match self.output {
+			// Bedrock OpenAIInvoke transport: the body is the OpenAI Chat
+			// Completions payload with transport-specific hygiene applied
+			// (history-side reasoning_content stripped, streaming usage
+			// guaranteed). Must run BEFORE the generic passthrough arm.
+			ChatFormat::OpenAICompletions
+				if matches!(
+					ctx.provider,
+					AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::OpenAIInvoke
+				) =>
+			{
+				let mut rendered = render_openai_completions(req, ctx)?;
+				rendered.body = conversion::bedrock_openai_invoke::prepare_invoke_body(&rendered.body)?;
+				rendered.transport_hints = TransportHints {
+					bedrock_openai_invoke: true,
+					..TransportHints::default()
+				};
+				return Ok(rendered);
+			},
 			ChatFormat::OpenAICompletions => return render_openai_completions(req, ctx),
 			ChatFormat::OpenAIResponses => render_openai_responses(req, ctx),
+			// Bedrock native Messages transport (Runtime InvokeModel): the
+			// body is the client's Anthropic payload plus the Bedrock
+			// envelope. This arm must run BEFORE the generic passthrough —
+			// Mantle backends (same ChatFormat) keep their plain rendering.
+			ChatFormat::AnthropicMessages
+				if matches!(
+					ctx.provider,
+					AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+				) =>
+			{
+				return render_bedrock_native_messages(req, ctx);
+			},
 			ChatFormat::AnthropicMessages if matches!(ctx.provider, AIProvider::Vertex(_)) => {
 				vertex::prepare_anthropic_message_body(render_anthropic_messages(req, ctx.catalog)?)
 			},
@@ -583,12 +674,14 @@ impl ChatTranslation {
 				return Ok(RenderedChatRequest {
 					body: render_vertex_gemini(req, ctx)?,
 					provider_state: Some(ProviderState::VertexGemini),
+					transport_hints: TransportHints::default(),
 				});
 			},
 		}?;
 		Ok(RenderedChatRequest {
 			body,
 			provider_state: None,
+			transport_hints: TransportHints::default(),
 		})
 	}
 
@@ -673,6 +766,38 @@ impl ChatTranslation {
 
 	fn stream(&self, resp: Response, ctx: ChatStreamContext) -> Response {
 		match self.output {
+			// Bedrock OpenAIInvoke transport: the upstream body is the AWS
+			// EventStream binary protocol carrying RAW OpenAI chunk JSON —
+			// re-frame it as OpenAI SSE (with the [DONE] terminator) before
+			// the standard per-input OpenAI-compat translations.
+			ChatFormat::OpenAICompletions if ctx.bedrock_openai_invoke => {
+				let resp = resp
+					.map(|b| conversion::bedrock_openai_invoke::transcode_stream_to_sse(b, ctx.buffer_limit));
+				match self.input {
+					InputFormat::Completions => {
+						conversion::completions::passthrough_stream(ctx.logger, ctx.log_content, resp)
+					},
+					InputFormat::Messages => resp.map(|b| {
+						conversion::completions::from_messages::translate_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+						)
+					}),
+					InputFormat::Responses => resp.map(|b| {
+						conversion::openai_compat::to_responses::translate_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+							ctx.namespaces,
+						)
+					}),
+					_ => resp,
+				}
+			},
+
 			ChatFormat::OpenAICompletions => match self.input {
 				InputFormat::Completions => {
 					conversion::completions::passthrough_stream(ctx.logger, ctx.log_content, resp)
@@ -715,6 +840,37 @@ impl ChatTranslation {
 					)
 				}),
 				_ => resp,
+			},
+
+			// Bedrock native Messages transport: the upstream body is the AWS
+			// EventStream binary protocol, so it is transcoded into Anthropic
+			// SSE first and then routed through the exact same per-input
+			// translations the direct Anthropic provider uses (passthrough for
+			// Messages clients, completions translation for OpenAI clients).
+			// No tool-name map exists on this path (provider_state is None).
+			ChatFormat::AnthropicMessages if ctx.bedrock_native => {
+				let resp = resp.map(|b| {
+					conversion::bedrock::from_messages_native::transcode_stream_to_sse(b, ctx.buffer_limit)
+				});
+				match self.input {
+					InputFormat::Messages => resp.map(|b| {
+						conversion::messages::passthrough_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+						)
+					}),
+					InputFormat::Completions => resp.map(|b| {
+						conversion::messages::from_completions::translate_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+						)
+					}),
+					_ => resp,
+				}
 			},
 
 			ChatFormat::AnthropicMessages => match self.input {
@@ -1745,6 +1901,8 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Completions,
+				false,
+				None,
 				req,
 				parts,
 				managed_body,
@@ -1756,6 +1914,31 @@ impl AIProvider {
 			.await
 	}
 
+	/// Whether this provider class may serve native Anthropic Tool Search
+	/// (deferred tool loading) traffic. Capability, not wire format: only the
+	/// Anthropic Platform provider carries the conformance evidence the
+	/// allowlist models were verified against. Bedrock serving
+	/// Anthropic-Messages wire format is deliberately NOT enough (a Mantle
+	/// leg accepts the request but silently eager-loads deferred tools), and
+	/// generic Anthropic API compatibility is never taken as evidence of
+	/// Tool Search semantics (2026-10-20 Fireworks conformance: shapes are
+	/// tolerated but the search tool never executes).
+	///
+	/// Exception (2026-11-01): a Bedrock backend whose configured chat
+	/// transport is `native-messages` serves Anthropic Messages bodies
+	/// verbatim through Runtime InvokeModel — AWS documents Tool Search as
+	/// available on exactly those APIs — so it qualifies as a native-capable
+	/// provider class. Converse and Mantle legs still never qualify; the
+	/// check re-runs on every provider attempt, so a failover onto a
+	/// Converse backend is rejected the same way as before.
+	pub fn provider_serves_native_tool_search(&self) -> bool {
+		matches!(self, AIProvider::Anthropic(_))
+			|| matches!(
+				self,
+				AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+			)
+	}
+
 	pub async fn process_messages_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
@@ -1765,16 +1948,129 @@ impl AIProvider {
 		log: &mut Option<&mut RequestLog>,
 		catalog: agent_llm::model_catalog::Catalog<'_>,
 	) -> Result<RequestResult, AIError> {
-		let (parts, managed_body, mut req) = self
+		let (mut parts, managed_body, mut req) = self
 			.read_body_and_default_model::<types::messages::Request>(policies, req, log)
 			.await?;
 		self.apply_model_alias(policies, &mut req);
+		// Capability-aware Tool Search routing (2026-10-20): native Tool
+		// Search is served ONLY for runtime-verified models
+		// (AGENTGATEWAY_TOOL_SEARCH_MODELS). For every other model the
+		// client's Tool Search shapes are downgraded to ordinary
+		// upfront-tool-loading inference here — before routing, so failover
+		// stays fully available — keeping unverified models' ordinary
+		// workflows (including tool use) working instead of erroring. The
+		// downgrade rewrites the deferred-tool protocol plumbing in history
+		// (tool_reference parts, search-round blocks) into its eager
+		// equivalent; anything it cannot translate keeps the strict guard
+		// below (defense in depth).
+		let mut native_tool_search = req.uses_native_tool_search();
+		// Models without verified native support also cannot serve Anthropic
+		// built-in server tools (web_search/web_fetch/code_execution):
+		// third-party providers reject those tool types outright (Fireworks
+		// 400, 2026-10-20). Downgrade those requests too — removal with
+		// telemetry beats relying on every client's retry-and-recover.
+		//
+		// Mode resolution: env allowlist (deployment safety ceiling) ∩ the
+		// dynamic policy artifact when one is configured (background refresh,
+		// last-known-good; see tool_search_policy). `off` in the artifact
+		// forces the downgrade even for allowlisted models.
+		let has_builtin_server_tools = req.offers_builtin_server_tools();
+		let model_name = req.model.as_deref().unwrap_or_default();
+		let decision =
+			tool_search_policy::tool_search_decision(tool_search_model_allowed(model_name), model_name);
+		if !decision.allow_native && (native_tool_search || has_builtin_server_tools) {
+			let report = req.downgrade_tool_search();
+			strip_tool_search_beta_headers(&mut parts.headers);
+			// Sanitized decision telemetry (counts only, never tool names or
+			// content): distinguishes eager downgrades from native serving and
+			// quantifies the history rewrite for observability.
+			info!(
+				tool_search.decision = "downgraded-eager",
+				tool_search.decision_reason = decision.reason,
+				tool_search.policy_revision = decision.policy_revision.as_deref().unwrap_or("env-only"),
+				tool_search.removed_server_tools = report.removed_server_tools,
+				tool_search.removed_builtin_server_tools = report.removed_builtin_server_tools,
+				tool_search.stripped_defer_loading = report.stripped_defer_loading,
+				tool_search.removed_tool_references = report.removed_tool_references,
+				tool_search.removed_search_rounds = report.removed_search_rounds,
+				tool_search.hoisted_schemas = report.hoisted_schemas,
+				tool_search.hoisted_schema_conflicts = report.hoisted_schema_conflicts,
+				tool_search.translated_builtin_rounds = report.translated_builtin_rounds,
+				tool_search.neutralized_tool_choice = report.neutralized_tool_choice,
+				"tool search downgraded to eager tool loading for unverified model"
+			);
+			native_tool_search = req.uses_native_tool_search();
+		}
+
+		// Claude Code Auto Mode safeguards (server-side classifier review),
+		// decided per attempt like the Tool Search guard above. The Anthropic
+		// Platform leg implements the protocol itself and is left untouched;
+		// an allowlisted non-native leg has the `safeguards` field and the
+		// `dangerous-tool-use` beta removed before upstream and carries a
+		// bounded review plan to the response side, which classifies the
+		// completed tool uses. Disabled mode is byte-identical to a gateway
+		// without this feature. Telemetry is counts and static labels only.
+		let safeguards_plan = {
+			let request_model = req.model.clone().unwrap_or_default();
+			let requested = types::safeguards::requested_dangerous_tool_use(&req.rest);
+			let runtime = safeguards::runtime();
+			let (identity, identity_source) = safeguards::identity_from_parts(
+				parts.extensions.get::<Claims>(),
+				parts
+					.extensions
+					.get::<crate::http::ext_authz::VerifiedSafeguardsIdentity>(),
+			);
+			let decision = safeguards::decide(
+				&runtime.config,
+				requested.is_some(),
+				matches!(self, AIProvider::Anthropic(_)),
+				&request_model,
+				identity.as_deref(),
+			);
+			// Redacted diagnostics: source NAMES only (header|claims|bearer|
+			// none), never identity values — enough to explain a denial.
+			if decision.is_denied() {
+				info!(
+					safeguards.identity_source = identity_source,
+					safeguards.decision = decision.label(),
+					safeguards.request_model = %request_model,
+					"safeguards identity resolution"
+				);
+			}
+			safeguards::record_decision(Some(backend_info.inputs.metrics.as_ref()), decision);
+			match (decision, requested) {
+				(safeguards::Decision::Classify { shadow }, Some(requested)) => {
+					let messages = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
+					let mut plan = types::safeguards::SafeguardsReviewPlan::from_request(
+						&request_model,
+						&messages,
+						&requested,
+					);
+					plan.identity = identity;
+					let removed_field = types::safeguards::remove_safeguards(&mut req.rest);
+					let removed_beta = types::safeguards::strip_dangerous_tool_use_beta(&mut parts.headers);
+					info!(
+						safeguards.decision = decision.label(),
+						safeguards.shadow = shadow,
+						safeguards.removed_field = removed_field,
+						safeguards.removed_beta = removed_beta,
+						safeguards.transcript_lines = plan.transcript.len(),
+						safeguards.transcript_truncated = plan.transcript_truncated,
+						"claude code safeguards handled locally for a non-native leg"
+					);
+					Some(Arc::new(plan))
+				},
+				_ => None,
+			}
+		};
 
 		self
 			.process_chat_request(
 				backend_info,
 				policies,
 				InputFormat::Messages,
+				native_tool_search,
+				safeguards_plan,
 				req,
 				parts,
 				managed_body,
@@ -1817,6 +2113,8 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Gemini,
+				false,
+				None,
 				req,
 				parts,
 				managed_body,
@@ -1909,6 +2207,8 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Responses,
+				false,
+				None,
 				req,
 				parts,
 				managed_body,
@@ -2259,6 +2559,8 @@ impl AIProvider {
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
 		original_format: InputFormat,
+		native_tool_search: bool,
+		safeguards: Option<Arc<types::safeguards::SafeguardsReviewPlan>>,
 		mut req: T,
 		mut parts: Parts,
 		mut managed_body: Body,
@@ -2276,6 +2578,30 @@ impl AIProvider {
 			.as_deref()
 			.ok_or_else(|| AIError::MissingField("model not specified".into()))?;
 		let chat_translation = self.chat_translation(original_format, request_model, catalog)?;
+		// Native Anthropic Tool Search (deferred tool loading) cannot survive a
+		// chat format conversion: the Bedrock Converse/OpenAI/Gemini conversions
+		// drop the tool_search server tool and flatten tool_reference blocks,
+		// silently turning a deferred-tool request into a plain text one. Fail
+		// closed before render, on EVERY attempt — initial selection and failover
+		// both re-enter here, so a later switch to an incompatible upstream is
+		// rejected the same way, never silently degraded.
+		if native_tool_search && chat_translation.output != ChatFormat::AnthropicMessages {
+			return Ok(RequestResult::Rejected(anthropic_toolsearch_incompatible(
+				chat_translation.output.tag(),
+			)));
+		}
+		// Capability-aware leg restriction (2026-10-20): a runtime-verified
+		// Tool Search model must be served by the provider class its
+		// conformance evidence was observed on — the Anthropic Platform.
+		// Bedrock serving Anthropic Messages wire format is NOT evidence of
+		// Tool Search semantics (observed 2026-10-20: a Mantle leg returns
+		// 200 while silently eager-loading every deferred tool), so a
+		// failover onto it is rejected explicitly instead of converted.
+		if native_tool_search && !self.provider_serves_native_tool_search() {
+			return Ok(RequestResult::Rejected(anthropic_toolsearch_incompatible(
+				"unverified-provider",
+			)));
+		}
 		let provider_format = chat_translation.provider_format();
 		let prepared = self
 			.prepare_request(
@@ -2312,6 +2638,8 @@ impl AIProvider {
 			},
 		)?;
 		llm_info.provider_state = rendered.provider_state;
+		llm_info.transport_hints = rendered.transport_hints;
+		llm_info.safeguards = safeguards;
 		// Couldn't find a better place to apply it, needs to be after rendered. but before generating the request.
 		let body = match policies {
 			Some(p) => p.apply_final_transformations(rendered.body, log)?,
@@ -2539,6 +2867,25 @@ impl AIProvider {
 		};
 
 		parts.headers.remove(header::CONTENT_LENGTH);
+		// Claude Code safeguards: a locally handled (non-native) Messages
+		// response gets its completed tool uses classified and, in enforce
+		// mode, `safeguard_results` stamped at the top level. Failures are
+		// verdicts, never errors on the agent's turn.
+		let body = match (&req.safeguards, req.input_format, parts.status.is_success()) {
+			(Some(plan), InputFormat::Messages, true) => {
+				safeguards::stamp_buffered(
+					plan.clone(),
+					body,
+					safeguards::EvalContext::for_response(
+						client.inputs.metrics.clone(),
+						rate_limit.request_traceparent.as_ref(),
+						plan.identity.clone(),
+					),
+				)
+				.await
+			},
+			_ => body,
+		};
 		let llm_info = LLMInfo::new(req, llm_resp);
 		parts
 			.extensions
@@ -2943,6 +3290,8 @@ impl AIProvider {
 		llm_resp.total_tokens = native.total_tokens;
 		llm_resp.cached_input_tokens = native.cached_input_tokens;
 		llm_resp.cache_creation_input_tokens = native.cache_creation_input_tokens;
+		llm_resp.cache_creation_5m_input_tokens = native.cache_creation_5m_input_tokens;
+		llm_resp.cache_creation_1h_input_tokens = native.cache_creation_1h_input_tokens;
 		llm_resp.reasoning_tokens = native.reasoning_tokens;
 		llm_resp.input_audio_tokens = native.input_audio_tokens;
 		llm_resp.output_audio_tokens = native.output_audio_tokens;
@@ -3026,6 +3375,9 @@ impl AIProvider {
 		} = logging;
 		let model = req.request_model.clone();
 		let input_format = req.input_format;
+		let safeguards_plan = req.safeguards.clone();
+		let safeguards_trace_id =
+			safeguards::trace_id_from_traceparent(response_policies.request_traceparent.as_ref());
 		let bedrock_tool_name_map = bedrock_tool_name_map(&req).cloned();
 		let namespaces = namespace_tool_map(&req).cloned();
 		let chat_translation = if input_format.is_chat() {
@@ -3121,6 +3473,14 @@ impl AIProvider {
 					log_content,
 					tool_name_map: bedrock_tool_name_map,
 					namespaces,
+					bedrock_native: matches!(
+						self,
+						AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+					),
+					bedrock_openai_invoke: matches!(
+						self,
+						AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::OpenAIInvoke
+					),
 				},
 			)
 		} else {
@@ -3140,6 +3500,24 @@ impl AIProvider {
 					)));
 				},
 			}
+		};
+
+		// Claude Code safeguards: hold the final `message_delta` of a locally
+		// handled Messages stream until the tool uses are classified, then stamp
+		// `safeguard_results` into it (shadow mode never holds). The usage
+		// logger stays owned by the translated body underneath.
+		let translated = match (safeguards_plan, input_format) {
+			(Some(plan), InputFormat::Messages) => {
+				let ctx = safeguards::EvalContext::for_stream(
+					client.inputs.metrics.clone(),
+					safeguards_trace_id,
+					plan.identity.clone(),
+				);
+				translated.map(|b| {
+					b.transform_stream(|b| safeguards::stream::SafeguardsSseBody::new(b, plan, ctx, buffer))
+				})
+			},
+			_ => translated,
 		};
 
 		if !evaluators.is_empty() {
@@ -3374,6 +3752,77 @@ fn google_invalid_argument(message: &str) -> ::http::Response<Body> {
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(body.to_string()))
 		.expect("failed to build gemini error response")
+}
+
+/// Terminal 400 in the Anthropic error shape for a `/v1/messages` request carrying
+/// native Tool Search (deferred tool loading) semantics that the selected upstream
+/// chat format cannot represent: converting would silently drop the `tool_search`
+/// server tool and flatten `tool_reference` blocks, degrading the request instead
+/// of executing it. Like the Gemini `alt=sse` guard, this answers directly rather
+/// than as an `AIError`, which would surface as a retryable 503 and invite SDK
+/// retry storms.
+fn anthropic_toolsearch_incompatible(upstream: &str) -> ::http::Response<Body> {
+	let body = serde_json::json!({
+		"type": "error",
+		"error": {
+			"type": "invalid_request_error",
+			"message": format!(
+				"This request uses Anthropic Tool Search (deferred tool loading), whose tool_reference semantics cannot be translated to the selected upstream format '{upstream}'. Route it to an Anthropic Messages-compatible provider; refusing rather than silently degrading the request."
+			),
+		}
+	});
+	::http::Response::builder()
+		.status(::http::StatusCode::BAD_REQUEST)
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(body.to_string()))
+		.expect("failed to build anthropic error response")
+}
+
+/// Models whose native Tool Search (deferred tool loading) this gateway is
+/// authorized to serve, from the comma-separated
+/// `AGENTGATEWAY_TOOL_SEARCH_MODELS` env on the proxy deployment. The list
+/// is generated from the control-plane catalog's runtime-verified
+/// capabilities (never hand-invented) and verified against it by the
+/// publication-ledger reconciliation. Absent/empty ⇒ NO model is served
+/// native Tool Search: clients' Tool Search shapes are downgraded to ordinary
+/// upfront-tool-loading inference (`process_messages_request`), so the
+/// feature degrades gracefully instead of failing hard.
+fn tool_search_model_allowed(model: &str) -> bool {
+	let Ok(list) = std::env::var("AGENTGATEWAY_TOOL_SEARCH_MODELS") else {
+		return false;
+	};
+	list.split(',').any(|entry| entry.trim() == model)
+}
+
+/// Remove the tool-search `anthropic-beta` values from a downgraded request
+/// so the upstream never sees a Tool Search beta it is not being asked (and
+/// verified) to serve. Other beta values on the same comma-separated header
+/// survive; the header is dropped entirely when nothing else remains.
+fn strip_tool_search_beta_headers(headers: &mut ::http::HeaderMap) {
+	let values: Vec<::http::HeaderValue> =
+		headers.get_all("anthropic-beta").iter().cloned().collect();
+	if values.is_empty() {
+		return;
+	}
+	headers.remove("anthropic-beta");
+	for value in values {
+		let Ok(raw) = value.to_str() else {
+			continue;
+		};
+		let kept: Vec<&str> = raw
+			.split(',')
+			.map(str::trim)
+			.filter(|beta| !beta.is_empty())
+			.filter(|beta| {
+				!beta.starts_with("tool-search-tool") && !beta.starts_with("advanced-tool-use")
+			})
+			.collect();
+		if !kept.is_empty()
+			&& let Ok(joined) = ::http::HeaderValue::from_str(&kept.join(", "))
+		{
+			headers.append("anthropic-beta", joined);
+		}
+	}
 }
 
 /// Remove `alt` from the request query, keeping any other parameters (e.g. `key`).

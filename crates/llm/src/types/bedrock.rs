@@ -361,8 +361,34 @@ pub enum ConverseOutput {
 	Unknown,
 }
 
-/// Token usage information
+/// TTL class of a cache-creation breakdown entry (AWS `CacheDetail.ttl`).
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CacheTtl {
+	/// 5-minute TTL class.
+	#[serde(rename = "5m")]
+	FiveMinutes,
+	/// 1-hour TTL class.
+	#[serde(rename = "1h")]
+	OneHour,
+	/// Unrecognized class — reported by the provider, never mapped.
+	#[serde(other)]
+	Unknown,
+}
+
+/// Per-TTL cache-creation metrics (AWS `CacheDetail`): how many tokens were
+/// written to cache under each TTL class.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct CacheDetail {
+	/// TTL duration for these cached tokens.
+	#[serde(rename = "ttl")]
+	pub ttl: CacheTtl,
+	/// Number of tokens written to cache with this TTL.
+	#[serde(rename = "inputTokens")]
+	pub input_tokens: usize,
+}
+
+/// Token usage information
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenUsage {
 	/// The number of input tokens which were used
 	#[serde(rename = "inputTokens")]
@@ -385,6 +411,12 @@ pub struct TokenUsage {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub cache_write_input_tokens: Option<usize>,
+	/// Per-TTL cache-write breakdown (AWS `cacheDetails`; the API returns it
+	/// sorted 1h before 5m). Absent/empty = only the aggregate
+	/// `cacheWriteInputTokens` was reported — consumers must not guess the
+	/// split.
+	#[serde(rename = "cacheDetails", skip_serializing_if = "Option::is_none")]
+	pub cache_details: Option<Vec<CacheDetail>>,
 }
 
 /// Metrics for the Converse call

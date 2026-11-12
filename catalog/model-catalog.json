@@ -426,7 +426,8 @@
             "input": "4",
             "output": "20",
             "cacheRead": "0.2",
-            "cacheWrite": "5"
+            "cacheWrite": "5",
+            "cacheWrite1h": "8"
           },
           "tags": [
             "adaptive_thinking"
@@ -1040,7 +1041,8 @@
             "input": "4",
             "output": "20",
             "cacheRead": "0.2",
-            "cacheWrite": "5"
+            "cacheWrite": "5",
+            "cacheWrite1h": "8"
           },
           "tags": [
             "adaptive_thinking"

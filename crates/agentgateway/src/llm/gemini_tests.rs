@@ -42,6 +42,8 @@ fn native_chat_request(model: &str, streaming: bool) -> LLMRequest {
 		params: Default::default(),
 		prompt: None,
 		provider_state: Some(ProviderState::VertexGemini),
+		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -51,6 +53,8 @@ fn count_tokens_request(model: &str) -> LLMRequest {
 	LLMRequest {
 		input_format: InputFormat::GeminiCountTokens,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 		..native_chat_request(model, false)
 	}
 }
@@ -173,6 +177,8 @@ fn set_required_fields_keeps_api_keys_on_the_compat_shim_and_explicit_locations(
 	let shim_request = LLMRequest {
 		input_format: InputFormat::Completions,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 		..native_chat_request("gemini-2.5-flash", false)
 	};
 	let mut req = crate::http::tests_common::request(
@@ -964,6 +970,8 @@ async fn streaming_response_is_forwarded_byte_for_byte() {
 				log_content: Default::default(),
 				tool_name_map: None,
 				namespaces: None,
+				bedrock_native: false,
+				bedrock_openai_invoke: false,
 			},
 		)
 		.into_body()
@@ -1031,6 +1039,7 @@ async fn gemini_inbound_requires_a_gemini_upstream() {
 				guardrail_identifier: None,
 				guardrail_version: None,
 				endpoint_preference: Default::default(),
+				transport: Default::default(),
 			})),
 			"bedrock-runtime.us-east-1.amazonaws.com",
 			"bedrock",

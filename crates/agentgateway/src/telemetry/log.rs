@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use tracing::{Level, debug, trace};
+use tracing::{Level, debug, trace, warn};
 use value_bag::visit::Visit;
 
 use crate::cel::{ContextBuilder, Expression, LLMContext};
@@ -966,6 +966,12 @@ impl DropOnLog {
 						response_model = ?llm_response.response_model,
 						"no model cost: model found but has no rates"
 					),
+					CostLookupStatus::Partial1hFallback => warn!(
+						provider = %llm_response.provider,
+						request_model = %llm_response.request_model,
+						response_model = ?llm_response.response_model,
+						"cost status partial: 1h cache writes priced at the 5m fallback rate — catalog card has no 1h rate; total is NOT a definitive 1h price"
+					),
 					CostLookupStatus::Exact | CostLookupStatus::NoCatalog => {},
 				}
 			}
@@ -1155,6 +1161,7 @@ impl RequestLog {
 			retry_backoff: None,
 			jwt_sub: None,
 			retry_attempt: None,
+			retry_reasons: Vec::new(),
 			error: None,
 			grpc_status: Default::default(),
 			mcp_status: Default::default(),
@@ -1332,6 +1339,8 @@ pub struct RequestLog {
 	pub jwt_sub: Option<String>,
 
 	pub retry_attempt: Option<u8>,
+	/// One `endpoint=outcome` entry per upstream attempt that was retried, in attempt order.
+	pub retry_reasons: Vec<String>,
 	pub error: Option<String>,
 
 	pub grpc_status: AsyncLog<u8>,
@@ -1393,6 +1402,31 @@ fn gen_ai_operation_name(input_format: InputFormat) -> &'static str {
 		// Detection has not identified the operation; do not assume it is chat.
 		InputFormat::Detect => "unknown",
 	}
+}
+
+/// Single-TTL proof for the native Bedrock Messages transport: the provider
+/// reported an aggregate cache-write total with no TTL split, and the request
+/// carried no `ttl: "1h"` checkpoint — so every write is provably 5m-class
+/// (a 1h write is impossible without a 1h checkpoint; implicit caching has no
+/// client control and defaults to the 5-minute class). When a 1h checkpoint
+/// WAS requested, the split is genuinely ambiguous and stays unresolved
+/// (fail closed) — never guessed.
+fn provable_5m_write_split(
+	request: Option<&llm::LLMRequest>,
+	response: &crate::cel::LLMContext,
+) -> bool {
+	let Some(request) = request else {
+		return false;
+	};
+	if !request.transport_hints.bedrock_native_messages {
+		return false;
+	}
+	if request.transport_hints.cache_1h_requested {
+		return false;
+	}
+	response.cache_creation_input_tokens.is_some()
+		&& response.cache_creation_5m_input_tokens.is_none()
+		&& response.cache_creation_1h_input_tokens.is_none()
 }
 
 impl Drop for DropOnLog {
@@ -1614,6 +1648,7 @@ impl Drop for DropOnLog {
 			}
 
 			let dur = format!("{}ms", duration.as_millis());
+			let retry_reasons = log.retry_reasons.join(",");
 			let route_duration = log
 				.ate_router_route_duration
 				.map(|duration| duration.as_secs_f64());
@@ -1846,6 +1881,27 @@ impl Drop for DropOnLog {
 					"gen_ai.provider.name",
 					log.llm_request.as_ref().map(|l| display(&l.provider)),
 				),
+				// Not part of official semconv: distinguishes the upstream
+				// wire transport for the same provider (Bedrock Converse vs
+				// native Anthropic Messages vs OpenAIInvoke, all over
+				// InvokeModel) so accounting attempts are attributable by
+				// provider, model AND transport.
+				(
+					"gen_ai.provider.transport",
+					log.llm_request.as_ref().and_then(|l| {
+						l.transport_hints
+							.bedrock_native_messages
+							.then_some(ValueBag::from("native-messages"))
+							.or_else(|| {
+								l.transport_hints
+									.bedrock_openai_invoke
+									.then_some(ValueBag::from("openai-invoke"))
+							})
+							.or_else(|| {
+								(l.provider.as_str() == "aws.bedrock").then_some(ValueBag::from("converse"))
+							})
+					}),
+				),
 				(
 					"gen_ai.request.model",
 					log.llm_request.as_ref().map(|l| display(&l.request_model)),
@@ -1863,6 +1919,39 @@ impl Drop for DropOnLog {
 						.as_ref()
 						.and_then(|l| l.cache_creation_input_tokens)
 						.map(Into::into),
+				),
+				// Per-TTL cache-write split (Accounting consumer contract —
+				// synapse-runtime accounting-tap `cache_write_5m/1h_tokens`).
+				// Absent (None) = the provider reported no split; the tap
+				// leaves the classes unknown and downstream settlement fails
+				// closed on ambiguous aggregates rather than approximating.
+				//
+				// Single-TTL proof (native Bedrock Messages transport): when
+				// the provider reports only an aggregate cache-write total
+				// and the request carried no `ttl: "1h"` checkpoint, every
+				// write is provably 5m-class (a 1h write is impossible
+				// without a 1h checkpoint; implicit caching has no client
+				// control and defaults to the 5-minute class). The aggregate
+				// is attributed to 5m and 1h is known-zero — never guessed
+				// when a 1h checkpoint was requested (that stays ambiguous).
+				(
+					"gen_ai.usage.cache_creation.input_tokens.5m",
+					llm_response.as_ref().and_then(|l| {
+						l.cache_creation_5m_input_tokens
+							.or_else(|| {
+								provable_5m_write_split(log.llm_request.as_ref(), l)
+									.then_some(l.cache_creation_input_tokens)?
+							})
+							.map(Into::into)
+					}),
+				),
+				(
+					"gen_ai.usage.cache_creation.input_tokens.1h",
+					llm_response.as_ref().and_then(|l| {
+						l.cache_creation_1h_input_tokens
+							.or_else(|| provable_5m_write_split(log.llm_request.as_ref(), l).then_some(0))
+							.map(Into::into)
+					}),
 				),
 				(
 					"gen_ai.usage.cache_read.input_tokens",
@@ -2005,6 +2094,10 @@ impl Drop for DropOnLog {
 					guardrails_json.as_ref().map(json_value_to_value_bag),
 				),
 				("retry.attempt", log.retry_attempt.display()),
+				(
+					"retry.reasons",
+					(!retry_reasons.is_empty()).then(|| retry_reasons.as_str().into()),
+				),
 				("error", log.error.quoted()),
 				("reason", reason.display()),
 				("duration", Some(dur.as_str().into())),
@@ -2914,6 +3007,8 @@ mod tests {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		}
 	}
 
@@ -3036,6 +3131,8 @@ mod tests {
 				content: "hello".into(),
 			}])),
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		};
 		let mut context = LLMContext::from(request);
 		context.completion = Some(vec!["world".to_string()]);
@@ -3253,7 +3350,19 @@ mod tests {
 			for streaming in [false, true] {
 				for has_response in [false, true] {
 					let (mut log, registry) = test_request_log_with_registry();
-					let mut request = metric_test_llm_request();
+					let mut request = llm::LLMRequest {
+						input_tokens: None,
+						input_format: llm::InputFormat::Messages,
+						cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+						request_model: "test-model".into(),
+						provider: "aws.bedrock".into(),
+						streaming: true,
+						params: Default::default(),
+						prompt: None,
+						provider_state: None,
+						safeguards: None,
+						transport_hints: llm::TransportHints::default(),
+					};
 					request.input_format = format;
 					request.streaming = streaming;
 					log.llm_request = Some(request.clone());
@@ -3608,6 +3717,125 @@ mod tests {
 		assert!(exporter.finished_spans().is_empty());
 	}
 
+	/// The per-TTL cache-write split reaches the span attributes exactly as
+	/// reported (Accounting tap contract `cache_write_5m/1h_tokens`); an
+	/// aggregate-only response leaves the split attributes absent — never
+	/// zero, never inferred.
+	#[test]
+	fn llm_span_emits_cache_write_ttl_split_attributes() {
+		let request = llm::LLMRequest {
+			safeguards: None,
+			transport_hints: Default::default(),
+			input_tokens: None,
+			input_format: InputFormat::Messages,
+			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+			request_model: strng::literal!("claude"),
+			provider: strng::literal!("bedrock"),
+			streaming: false,
+			params: llm::LLMRequestParams::default(),
+			prompt: None,
+			provider_state: None,
+		};
+		let split = llm::LLMResponse {
+			input_tokens: Some(50),
+			cache_creation_input_tokens: Some(300),
+			cache_creation_5m_input_tokens: Some(200),
+			cache_creation_1h_input_tokens: Some(100),
+			output_tokens: Some(20),
+			total_tokens: Some(370),
+			..Default::default()
+		};
+		let aggregate_only = llm::LLMResponse {
+			input_tokens: Some(50),
+			cache_creation_input_tokens: Some(300),
+			output_tokens: Some(20),
+			total_tokens: Some(370),
+			..Default::default()
+		};
+
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request.clone(), split)));
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| &attr.value)
+		};
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens.5m"),
+			Some(&opentelemetry::Value::I64(200))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens.1h"),
+			Some(&opentelemetry::Value::I64(100))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens"),
+			Some(&opentelemetry::Value::I64(300))
+		);
+
+		// Aggregate-only producer: split attributes ABSENT, aggregate intact.
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request);
+		log.llm_response.store(Some(llm::LLMInfo::new(
+			llm::LLMRequest {
+				safeguards: None,
+				transport_hints: Default::default(),
+				input_tokens: None,
+				input_format: InputFormat::Messages,
+				cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+				request_model: strng::literal!("claude"),
+				provider: strng::literal!("bedrock"),
+				streaming: false,
+				params: llm::LLMRequestParams::default(),
+				prompt: None,
+				provider_state: None,
+			},
+			aggregate_only,
+		)));
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| &attr.value)
+		};
+		assert_eq!(value("gen_ai.usage.cache_creation.input_tokens.5m"), None);
+		assert_eq!(value("gen_ai.usage.cache_creation.input_tokens.1h"), None);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens"),
+			Some(&opentelemetry::Value::I64(300))
+		);
+	}
+
 	#[test]
 	fn llm_span_uses_cache_inclusive_input_tokens() {
 		let request = llm::LLMRequest {
@@ -3620,6 +3848,8 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		};
 		let response = llm::LLMResponse {
 			input_tokens: Some(50),
@@ -3697,6 +3927,8 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		};
 
 		let completeness = |response: llm::LLMResponse| -> Option<bool> {
@@ -3778,6 +4010,8 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		};
 		let response = llm::LLMResponse {
 			input_tokens: Some(1_000_000),
@@ -3882,5 +4116,74 @@ mod tests {
 		] {
 			assert!(has(expected), "expected {expected} span attribute");
 		}
+	}
+}
+
+#[cfg(test)]
+mod native_transport_tests {
+	use super::*;
+
+	#[test]
+	fn provable_5m_split_applies_only_to_native_no_1h_requests() {
+		let mut request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: llm::InputFormat::Messages,
+			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+			request_model: "test-model".into(),
+			provider: "aws.bedrock".into(),
+			streaming: true,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+			safeguards: None,
+			transport_hints: llm::TransportHints::default(),
+		};
+		// Non-native transports keep the historical behavior: aggregate-only
+		// stays ambiguous, never attributed by inference.
+		request.transport_hints = llm::TransportHints::default();
+		let make_ctx = |cache_creation: Option<u64>, split_5m: Option<u64>, split_1h: Option<u64>| {
+			let request = llm::LLMRequest {
+				input_tokens: None,
+				input_format: llm::InputFormat::Messages,
+				cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+				request_model: "test-model".into(),
+				provider: "aws.bedrock".into(),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+				provider_state: None,
+				safeguards: None,
+				transport_hints: llm::TransportHints::default(),
+			};
+			let mut info = llm::LLMInfo::new(request, llm::LLMResponse::default());
+			info.response.cache_creation_input_tokens = cache_creation;
+			info.response.cache_creation_5m_input_tokens = split_5m;
+			info.response.cache_creation_1h_input_tokens = split_1h;
+			crate::cel::LLMContext::from_llm_info(info, None)
+		};
+		let ctx = make_ctx(Some(8400), None, None);
+		assert!(!provable_5m_write_split(Some(&request), &ctx));
+
+		// Native transport without a 1h checkpoint: the aggregate is
+		// provably 5m-class.
+		request.transport_hints = llm::TransportHints {
+			bedrock_native_messages: true,
+			bedrock_openai_invoke: false,
+			cache_1h_requested: false,
+		};
+		assert!(provable_5m_write_split(Some(&request), &ctx));
+
+		// A requested 1h checkpoint makes the aggregate genuinely ambiguous.
+		request.transport_hints.cache_1h_requested = true;
+		assert!(!provable_5m_write_split(Some(&request), &ctx));
+
+		// Provider-reported split always wins (never re-attributed).
+		request.transport_hints.cache_1h_requested = false;
+		let ctx_split = make_ctx(Some(8400), Some(100), None);
+		assert!(!provable_5m_write_split(Some(&request), &ctx_split));
+
+		// No aggregate at all: nothing to attribute.
+		let ctx_empty = make_ctx(None, None, None);
+		assert!(!provable_5m_write_split(Some(&request), &ctx_empty));
 	}
 }

@@ -52,6 +52,8 @@ fn captured_info() -> Arc<Mutex<LLMInfo>> {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	}))
@@ -153,6 +155,53 @@ async fn passthrough_stream_message_delta_without_usage_leaves_no_zero_fabricati
 		info.response.usage_complete, None,
 		"no usage evidence at all: completeness stays untracked, not falsely final"
 	);
+}
+
+/// The terminal `message_delta` usage may carry the Anthropic
+/// `usage.cache_creation` split object. The telemetry evidence must carry
+/// the per-TTL classes exactly as reported — including an explicit
+/// `Some(0)` bucket, which is real split evidence, not absence — and the
+/// client-facing passthrough wire stays byte-identical (json_passthrough).
+#[tokio::test]
+async fn passthrough_stream_message_delta_carries_ttl_split() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":67769,"output_tokens":44,"cache_creation_input_tokens":67759,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":67759,"ephemeral_1h_input_tokens":0}}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
+	assert_eq!(
+		info.response.cache_creation_5m_input_tokens,
+		Some(67759),
+		"5m bucket is explicit split evidence"
+	);
+	assert_eq!(
+		info.response.cache_creation_1h_input_tokens,
+		Some(0),
+		"a reported 1h zero is evidence of absence, not unknown"
+	);
+	assert_eq!(info.response.usage_complete, Some(true));
+}
+
+/// Aggregate-only streams (older providers, `cache_creation` absent) must
+/// keep the split unknown — never zero-fabricated — so downstream
+/// accounting keeps failing closed on ambiguous aggregates.
+#[tokio::test]
+async fn passthrough_stream_aggregate_only_keeps_ttl_split_unknown() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":91,"output_tokens":16,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, None);
+	assert_eq!(info.response.cache_creation_1h_input_tokens, None);
 }
 
 fn message_start_with_usage(usage_json: &str) -> String {
@@ -444,4 +493,44 @@ async fn passthrough_stream_cache_usage_is_preserved() {
 		Some(128),
 		"cache_creation evidence must survive extraction"
 	);
+}
+
+/// Captured production `message_start` shape (golden stream_basic): a
+/// small aggregate alongside an all-zero split — the provider's
+/// authoritative sub-minimum no-op write evidence. The split buckets are
+/// forwarded EXACTLY as reported (Some(0)/Some(0) — real evidence, not
+/// absence) and the terminal delta, which carries no split here, leaves
+/// that evidence untouched instead of clobbering it.
+#[tokio::test]
+async fn passthrough_stream_sub_minimum_zero_split_is_authoritative_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":15,"output_tokens":1,"cache_creation_input_tokens":13,"cache_read_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":21}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(13));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
+}
+
+/// Real Anthropic streaming shape (production canary): the input-side
+/// usage is final at `message_start` and SELF-CONSISTENT
+/// (aggregate == 5m + 1h), while the terminal delta carries no split. The
+/// consistent split becomes evidence at start and survives the delta.
+#[tokio::test]
+async fn passthrough_stream_consistent_message_start_split_becomes_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":67759,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":67759,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":44}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
 }

@@ -1,7 +1,10 @@
 package agentgatewaybackend_test
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -628,6 +631,24 @@ func TestBuildAIBackend(t *testing.T) {
 			},
 		},
 		{
+			name: "Valid Bedrock backend with OpenAIInvoke transport",
+			backend: &agentgateway.AgentgatewayBackend{
+				Name:      "kimi-k31-openaiinvoke",
+				Namespace: "test-ns",
+				Spec: agentgateway.AgentgatewayBackendSpec{
+					AI: &agentgateway.AIBackend{
+						LLM: &agentgateway.LLMProvider{
+							Bedrock: &agentgateway.BedrockConfig{
+								Model:     new("global.moonshotai.kimi-k3.1"),
+								Region:    "eu-west-1",
+								Transport: agentgateway.BedrockTransportOpenAIInvoke,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "OpenAI backend with secret reference auth",
 			backend: &agentgateway.AgentgatewayBackend{
 				Name:      "openai-secret-backend",
@@ -806,6 +827,60 @@ func TestBuildAIBackend(t *testing.T) {
 						LLM: &agentgateway.LLMProvider{
 							Bedrock: &agentgateway.BedrockConfig{
 								Region: "us-east-1",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Bedrock backend with native messages transport",
+			backend: &agentgateway.AgentgatewayBackend{
+				Name:      "bedrock-native-messages",
+				Namespace: "test-ns",
+				Spec: agentgateway.AgentgatewayBackendSpec{
+					AI: &agentgateway.AIBackend{
+						LLM: &agentgateway.LLMProvider{
+							Bedrock: &agentgateway.BedrockConfig{
+								Region:    "eu-west-1",
+								Model:     new("eu.anthropic.claude-sonnet-5-5"),
+								Transport: agentgateway.BedrockTransportNativeMessages,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Bedrock backend with explicit converse transport",
+			backend: &agentgateway.AgentgatewayBackend{
+				Name:      "bedrock-explicit-converse",
+				Namespace: "test-ns",
+				Spec: agentgateway.AgentgatewayBackendSpec{
+					AI: &agentgateway.AIBackend{
+						LLM: &agentgateway.LLMProvider{
+							Bedrock: &agentgateway.BedrockConfig{
+								Region:    "eu-west-1",
+								Model:     new("eu.anthropic.claude-sonnet-5-5"),
+								Transport: agentgateway.BedrockTransportConverse,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Bedrock backend with unknown transport value resolves to converse default",
+			backend: &agentgateway.AgentgatewayBackend{
+				Name:      "bedrock-unknown-transport",
+				Namespace: "test-ns",
+				Spec: agentgateway.AgentgatewayBackendSpec{
+					AI: &agentgateway.AIBackend{
+						LLM: &agentgateway.LLMProvider{
+							Bedrock: &agentgateway.BedrockConfig{
+								Region:    "eu-west-1",
+								Model:     new("eu.anthropic.claude-sonnet-5-5"),
+								Transport: agentgateway.BedrockTransport("SomethingElse"),
 							},
 						},
 					},
@@ -1341,4 +1416,45 @@ type jsonMarshalProto struct {
 
 func (p jsonMarshalProto) MarshalJSON() ([]byte, error) {
 	return protomarshal.Marshal(p.Message)
+}
+
+// TestBedrockTransportXdsWireFixture pins the exact xDS Resource bytes the
+// controller emits for a native-messages Bedrock backend and shares them with
+// the Rust proxy test suite (crates/agentgateway/tests/common/testdata/
+// bedrock_native_backend.base64), so both sides are proven against the same
+// wire input. Because krtxds versions resources by content hash
+// (pkg/syncer/krtxds/xds.go), any change to these bytes also proves the xDS
+// version changes, which is what makes an in-place transport edit propagate
+// without a controller restart. Refresh with REFRESH_GOLDEN=true.
+func TestBedrockTransportXdsWireFixture(t *testing.T) {
+	fixture := filepath.Join("..", "..", "..", "..", "crates", "agentgateway", "tests", "common", "testdata", "bedrock_native_backend.base64")
+	backend := &agentgateway.AgentgatewayBackend{
+		Name:      "bedrock-native-messages",
+		Namespace: "test-ns",
+		Spec: agentgateway.AgentgatewayBackendSpec{
+			AI: &agentgateway.AIBackend{
+				LLM: &agentgateway.LLMProvider{
+					Bedrock: &agentgateway.BedrockConfig{
+						Region:    "eu-west-1",
+						Model:     new("eu.anthropic.claude-sonnet-5-5"),
+						Transport: agentgateway.BedrockTransportNativeMessages,
+					},
+				},
+			},
+		},
+	}
+	ctx := testutils.BuildMockPolicyContext(t, nil)
+	result, err := agentgatewaybackend.BuildAgwBackend(ctx, backend)
+	assert.NoError(t, err)
+	b, err := proto.Marshal(result[0])
+	assert.NoError(t, err)
+	encoded := []byte(base64.StdEncoding.EncodeToString(b) + "\n")
+
+	if os.Getenv("REFRESH_GOLDEN") == "true" {
+		assert.NoError(t, os.WriteFile(fixture, encoded, 0o644))
+		return
+	}
+	got, err := os.ReadFile(fixture)
+	assert.NoError(t, err)
+	assert.Equal(t, string(encoded), string(got))
 }

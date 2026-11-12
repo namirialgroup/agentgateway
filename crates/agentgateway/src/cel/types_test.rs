@@ -140,6 +140,8 @@ fn build_test_request() -> crate::http::Request {
 		count_tokens: None,
 		reasoning_tokens: None,
 		cache_creation_input_tokens: None,
+		cache_creation_5m_input_tokens: None,
+		cache_creation_1h_input_tokens: None,
 		cached_input_tokens: None,
 		prompt: None,
 		completion: Some(vec!["Hello world".to_string()]),
@@ -169,6 +171,8 @@ fn llm_context_with_usage(
 		params: llm::LLMRequestParams::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	LLMContext::from_llm_info(llm::LLMInfo::new(request, response), None)
 }

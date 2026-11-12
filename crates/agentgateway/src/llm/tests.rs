@@ -75,6 +75,8 @@ fn llm_request_with_tokens(input_tokens: Option<u64>) -> LLMRequest {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -114,6 +116,7 @@ fn bedrock_chat_translation_follows_endpoint_selection() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: pref,
+			transport: bedrock::BedrockTransport::Converse,
 		}))
 	}
 
@@ -200,6 +203,7 @@ async fn bedrock_chat_cache_convention_follows_upstream_format() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+			transport: Default::default(),
 		}));
 		let body = if input == InputFormat::Responses {
 			json!({"model": model, "input": "hello"})
@@ -245,6 +249,7 @@ fn bedrock_mantle_never_sends_completions_to_a_claude_model() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+			transport: Default::default(),
 		}))
 	}
 	let mantle = mantle_provider();
@@ -1640,6 +1645,8 @@ fn gemini_count_tokens_response_reports_total_tokens() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let body = br#"{"totalTokens":31,"promptTokensDetails":[{"modality":"TEXT","tokenCount":31}]}"#;
 	let buffered = BufferedResponse {
@@ -1667,6 +1674,7 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let req = LLMRequest {
 		input_tokens: None,
@@ -1678,6 +1686,8 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let body =
 		bytes::Bytes::from_static(br#"{"message":"The provided model does not support CountTokens"}"#);
@@ -2012,6 +2022,7 @@ async fn bedrock_transformed_provider_model_is_used_for_upstream_path() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let inputs = setup_proxy_test("{}").unwrap().pi;
 	let backend_info = BackendInfo {
@@ -2094,6 +2105,7 @@ async fn bedrock_provider_model_overrides_client_model() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let inputs = setup_proxy_test("{}").unwrap().pi;
 	let backend_info = BackendInfo {
@@ -2574,6 +2586,7 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 
 	let error_json = r#"{"message":"Expected toolResult blocks at messages.2.content for the following Ids: tooluse_abc123"}"#;
@@ -2588,6 +2601,8 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 
 	let body = Body::from(error_json.as_bytes().to_vec());
@@ -2852,6 +2867,7 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 
 	let body = Body::from(
@@ -2882,6 +2898,8 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			LLMResponsePolicies::default(),
 			None,
@@ -2991,6 +3009,8 @@ fn setup_request_custom_path_override_wins_over_format_path() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let mut req = crate::http::tests_common::request(
 		"https://proxy.example.com/v1/chat/completions?trace=repro",
@@ -3027,6 +3047,8 @@ fn setup_request_drops_inbound_query_only_when_translated() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	for (provider, route_type, expected_query) in [
 		(
@@ -3050,6 +3072,7 @@ fn setup_request_drops_inbound_query_only_when_translated() {
 				guardrail_identifier: None,
 				guardrail_version: None,
 				endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+				transport: Default::default(),
 			}),
 			RouteType::Messages,
 			Some("beta=true"),
@@ -3103,6 +3126,8 @@ fn setup_request_custom_generate_content_defaults_to_the_native_path() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: Some(ProviderState::VertexGemini),
+			safeguards: None,
+			transport_hints: Default::default(),
 		};
 		let mut req = crate::http::tests_common::request(
 			"https://gemini.example.com/v1beta/models/gemini-2.5-flash:generateContent",
@@ -3143,6 +3168,8 @@ fn setup_request_custom_count_tokens_defaults_to_the_native_path() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let mut req = crate::http::tests_common::request(
 		"https://gemini.example.com/v1beta/models/gemini-2.5-flash:countTokens",
@@ -3181,6 +3208,8 @@ fn llm_request_for_path(request_model: &str) -> LLMRequest {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -3225,6 +3254,8 @@ fn native_gemini_llm_request(request_model: &str, streaming: bool) -> LLMRequest
 		params: Default::default(),
 		prompt: None,
 		provider_state: Some(ProviderState::VertexGemini),
+		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -3352,6 +3383,8 @@ fn setup_request_gemini_without_native_state_keeps_compat_path() {
 	let llm_request = LLMRequest {
 		input_format: InputFormat::Completions,
 		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
 		..native_gemini_llm_request("gemini-2.5-flash", false)
 	};
 	let mut req = crate::http::tests_common::request(
@@ -3412,6 +3445,7 @@ fn setup_request_bedrock_applies_path_prefix_with_host_override() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		}),
 		"anthropic.claude-3-5-sonnet-20241022-v2:0",
 		"/proxy/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse",
@@ -3427,6 +3461,7 @@ fn setup_request_bedrock_sets_signing_region_with_host_override() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let mut req = crate::http::tests_common::request(
 		"https://bedrock-vpce.example.com/model/example/converse",
@@ -3542,6 +3577,8 @@ async fn bedrock_from_messages_stream_captures_completion() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3592,6 +3629,8 @@ async fn bedrock_from_messages_stream_skips_completion_when_disabled() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3639,6 +3678,8 @@ async fn bedrock_from_messages_stream_captures_tool_calls() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3698,6 +3739,8 @@ async fn messages_passthrough_stream_captures_completion() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3746,6 +3789,8 @@ async fn messages_passthrough_stream_skips_completion_when_disabled() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3790,6 +3835,8 @@ async fn messages_passthrough_stream_captures_tool_calls() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3845,6 +3892,8 @@ async fn responses_passthrough_stream_captures_completion_and_tool_calls() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3908,6 +3957,8 @@ data: [DONE]
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3945,6 +3996,8 @@ async fn responses_passthrough_stream_skips_completion_when_disabled() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -4203,6 +4256,7 @@ fn fixed_providers_classify_by_family() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+		transport: Default::default(),
 	}));
 	for (path, expected) in [
 		(
@@ -4245,4 +4299,686 @@ fn query_requests_sse_matches_alt_query_parameter() {
 	assert!(!query_requests_sse(&uri(
 		"/v1beta/models/gemini-2.5-flash:streamGenerateContent?halt=sse"
 	)));
+}
+
+// ── Native Tool Search (deferred tool loading) request-level guard ──────────
+//
+// Capability-aware routing (2026-10-20): native Tool Search is served ONLY
+// for runtime-verified models (AGENTGATEWAY_TOOL_SEARCH_MODELS, generated
+// from the control-plane catalog's proven capabilities). For any other model
+// the request's Tool Search shapes are downgraded to ordinary upfront-tool
+// loading BEFORE routing — unverified models keep working, failover intact.
+// Verified models must stay on the Anthropic Platform provider leg: format
+// conversion is rejected (Bedrock Converse/OpenAI/Gemini drop the semantics)
+// and so is a failover to a Bedrock leg — wire-format acceptance there is
+// NOT capability evidence (a Mantle leg 200s while silently eager-loading).
+
+/// Scoped AGENTGATEWAY_TOOL_SEARCH_MODELS for one test: locks the process env
+/// (crate::config::lock_env_for_tests_async) so parallel tests never observe a
+/// foreign value, and restores the previous state on drop.
+struct ScopedToolSearchEnv {
+	_guard: tokio::sync::MutexGuard<'static, ()>,
+	previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedToolSearchEnv {
+	async fn allow(models: &str) -> Self {
+		let guard = crate::config::lock_env_for_tests_async().await;
+		let previous = std::env::var_os("AGENTGATEWAY_TOOL_SEARCH_MODELS");
+		unsafe {
+			std::env::set_var("AGENTGATEWAY_TOOL_SEARCH_MODELS", models);
+		}
+		Self {
+			_guard: guard,
+			previous,
+		}
+	}
+}
+
+impl Drop for ScopedToolSearchEnv {
+	fn drop(&mut self) {
+		match &self.previous {
+			Some(value) => unsafe {
+				std::env::set_var("AGENTGATEWAY_TOOL_SEARCH_MODELS", value);
+			},
+			None => unsafe {
+				std::env::remove_var("AGENTGATEWAY_TOOL_SEARCH_MODELS");
+			},
+		}
+	}
+}
+
+fn toolsearch_backend_info() -> crate::http::auth::BackendInfo {
+	use crate::types::agent::BackendTarget;
+	crate::http::auth::BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("localhost", 443)),
+		inputs: crate::test_helpers::proxymock::setup_proxy_test("{}")
+			.unwrap()
+			.pi,
+	}
+}
+
+fn toolsearch_body(model: &str, stream: bool) -> serde_json::Value {
+	let mut body = json!({
+		"model": model,
+		"max_tokens": 64,
+		"messages": [
+			{"role": "user", "content": "find a tool for that"},
+			{"role": "assistant", "content": [
+				{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+			]}
+		],
+		"tools": [
+			{"type": "tool_search_tool_regex_20250922"},
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+				"defer_loading": true
+			}
+		]
+	});
+	if stream {
+		body["stream"] = json!(true);
+	}
+	body
+}
+
+async fn process_toolsearch_messages(
+	provider: &AIProvider,
+	body: serde_json::Value,
+) -> Result<RequestResult, AIError> {
+	process_toolsearch_messages_with_beta(provider, body, None).await
+}
+
+async fn process_toolsearch_messages_with_beta(
+	provider: &AIProvider,
+	body: serde_json::Value,
+	anthropic_beta: Option<&str>,
+) -> Result<RequestResult, AIError> {
+	let backend_info = toolsearch_backend_info();
+	let mut builder = ::http::Request::builder()
+		.method("POST")
+		.uri("https://example.com/v1/messages");
+	if let Some(beta) = anthropic_beta {
+		builder = builder.header("anthropic-beta", beta);
+	}
+	let req = builder
+		.body(Body::from(serde_json::to_vec(&body).unwrap()))
+		.unwrap();
+	provider
+		.process_messages_request(&backend_info, None, req, false, &mut None, None)
+		.await
+}
+
+#[tokio::test]
+async fn toolsearch_request_to_bedrock_converse_is_rejected() {
+	// The model is runtime-verified (in the allowlist): the request must stay
+	// native Tool Search, and Converse cannot represent it.
+	let _env = ScopedToolSearchEnv::allow("anthropic.claude-sonnet-4-5-v1:0").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
+	}));
+	let result = process_toolsearch_messages(
+		&provider,
+		toolsearch_body("anthropic.claude-sonnet-4-5-v1:0", false),
+	)
+	.await
+	.unwrap();
+	let RequestResult::Rejected(response) = result else {
+		panic!("expected rejection, got {result:?}");
+	};
+	assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+	let bytes = http_body_util::BodyExt::collect(response.into_body())
+		.await
+		.unwrap()
+		.to_bytes();
+	let error: Value = serde_json::from_slice(&bytes).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	let message = error["error"]["message"].as_str().unwrap();
+	assert!(
+		message.contains("Tool Search"),
+		"message should name Tool Search: {message}"
+	);
+	assert!(
+		message.contains("bedrock"),
+		"message should name the upstream format: {message}"
+	);
+}
+
+#[tokio::test]
+async fn streaming_toolsearch_request_to_bedrock_is_rejected_before_sse() {
+	let _env = ScopedToolSearchEnv::allow("anthropic.claude-sonnet-4-5-v1:0").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
+	}));
+	let result = process_toolsearch_messages(
+		&provider,
+		toolsearch_body("anthropic.claude-sonnet-4-5-v1:0", true),
+	)
+	.await
+	.unwrap();
+	assert!(
+		matches!(result, RequestResult::Rejected(_)),
+		"streaming must be rejected the same way pre-SSE"
+	);
+}
+
+#[tokio::test]
+async fn tool_reference_history_alone_is_rejected_on_conversion() {
+	let _env = ScopedToolSearchEnv::allow("anthropic.claude-sonnet-4-5-v1:0").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
+	}));
+	let mut body = toolsearch_body("anthropic.claude-sonnet-4-5-v1:0", false);
+	body["tools"].as_array_mut().unwrap().remove(0); // keep only the ordinary deferred custom tool
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	assert!(
+		matches!(result, RequestResult::Rejected(_)),
+		"tool_reference history alone must be rejected"
+	);
+}
+
+#[tokio::test]
+async fn toolsearch_request_to_openai_is_rejected() {
+	// gpt-4o is runtime-verified in this scenario: the guard must reject the
+	// conversion rather than silently dropping the deferred-tool semantics.
+	let _env = ScopedToolSearchEnv::allow("gpt-4o").await;
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model_override: None,
+		moderation: None,
+	});
+	let result = process_toolsearch_messages(&provider, toolsearch_body("gpt-4o", false))
+		.await
+		.unwrap();
+	assert!(
+		matches!(result, RequestResult::Rejected(_)),
+		"openai conversion must be rejected"
+	);
+}
+
+#[tokio::test]
+async fn toolsearch_request_to_anthropic_passes_through() {
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-4-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let result = process_toolsearch_messages(&provider, toolsearch_body("claude-sonnet-4-5", false))
+		.await
+		.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("anthropic passthrough must succeed, got {result:?}");
+	};
+	// The rendered upstream body must still carry the tool_search server tool.
+	let bytes = http_body_util::BodyExt::collect(request.into_body())
+		.await
+		.unwrap()
+		.to_bytes();
+	let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+	let tools = rendered["tools"]
+		.as_array()
+		.expect("tools survive passthrough");
+	assert!(
+		tools
+			.iter()
+			.any(|t| t["type"].as_str() == Some("tool_search_tool_regex_20250922")),
+		"tool_search tool must survive the anthropic render: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn toolsearch_request_to_bedrock_native_messages_passes_through() {
+	// Stage 2026-11-02 discriminator: with the model runtime-verified
+	// (AGENTGATEWAY_TOOL_SEARCH_MODELS) and the backend chat transport set to
+	// native-messages (Runtime InvokeModel), the Tool Search shapes must
+	// reach the wire untouched — the versioned server tool, defer_loading
+	// and tool_reference history all survive the render. Live Bedrock
+	// evidence behind this expectation: the identical body direct-invoked
+	// produced server_tool_use + tool_search_tool_result with a nested
+	// tool_reference, then a tool_use of the discovered tool.
+	let _env = ScopedToolSearchEnv::allow("claude-opus-5-5").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: bedrock::BedrockTransport::NativeMessages,
+	}));
+	let mut body = toolsearch_body("claude-opus-5-5", false);
+	// Exact Stage T2 wire shape (the fixture's unversioned-type entry is
+	// replaced with the live-verified versioned shape).
+	body["tools"][0] = json!({
+		"type": "tool_search_tool_regex_20251119",
+		"name": "tool_search_tool_regex"
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("bedrock native passthrough must succeed, got {result:?}");
+	};
+	let bytes = http_body_util::BodyExt::collect(request.into_body())
+		.await
+		.unwrap()
+		.to_bytes();
+	let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+	let rendered_str = rendered.to_string();
+	assert!(
+		rendered_str.contains("tool_search_tool_regex_20251119"),
+		"versioned server tool must survive the native render: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("defer_loading"),
+		"defer_loading must survive the native render: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("tool_reference"),
+		"tool_reference history must survive the native render: {rendered}"
+	);
+	assert_eq!(
+		rendered["anthropic_version"].as_str(),
+		Some("bedrock-2023-05-31"),
+		"InvokeModel envelope must be owned by the gateway"
+	);
+}
+
+#[tokio::test]
+async fn verified_model_toolsearch_on_bedrock_mantle_is_rejected() {
+	// Bedrock Mantle serving a Claude model speaks the Anthropic Messages wire
+	// format — the SHAPE survives verbatim — but wire-format acceptance is not
+	// capability evidence: a Mantle leg returns 200 while silently
+	// eager-loading every deferred tool (observed 2026-10-20). A
+	// runtime-verified Tool Search model must therefore be rejected on a
+	// Bedrock leg instead of silently degraded, even though the format would
+	// round-trip.
+	let _env = ScopedToolSearchEnv::allow("anthropic.claude-sonnet-4-5-v1:0").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+		transport: Default::default(),
+	}));
+	let result = process_toolsearch_messages(
+		&provider,
+		toolsearch_body("anthropic.claude-sonnet-4-5-v1:0", false),
+	)
+	.await
+	.unwrap();
+	let RequestResult::Rejected(response) = result else {
+		panic!("expected rejection, got {result:?}");
+	};
+	assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+	let bytes = http_body_util::BodyExt::collect(response.into_body())
+		.await
+		.unwrap()
+		.to_bytes();
+	let error: Value = serde_json::from_slice(&bytes).unwrap();
+	let message = error["error"]["message"].as_str().unwrap();
+	assert!(
+		message.contains("unverified-provider"),
+		"message should name the unverified provider leg: {message}"
+	);
+}
+
+#[tokio::test]
+async fn builtin_web_search_only_request_is_downgraded_for_unverified_model() {
+	// 2026-10-20 class C entry gate: a request carrying ONLY Anthropic
+	// built-in server tools (no Tool Search shapes at all) on an unverified
+	// model must trigger the downgrade too — otherwise the web_search tool
+	// forwards verbatim and the upstream 400s, leaving the outcome to the
+	// client's retry-and-recover.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let body = json!({
+		"model": "glm-5p3-flash",
+		"max_tokens": 64,
+		"stream": true,
+		"messages": [{"role": "user", "content": "prezzo dell'oro"}],
+		"tools": [
+			{"type": "web_search_20250329", "name": "web_search"},
+			{"name": "get_weather", "description": "Get the weather", "input_schema": {"type": "object"}}
+		]
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("web_search-only request must downgrade and convert, got {result:?}");
+	};
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("web_search"),
+		"built-in server tool must not reach the upstream: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("get_weather"),
+		"ordinary tools must survive: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn unverified_model_toolsearch_is_downgraded_to_ordinary_tools() {
+	// The allowlist names a DIFFERENT model: this one's Tool Search shapes must
+	// be downgraded before routing, so the request converts cleanly to OpenAI
+	// (failover stays available) with the tool_search server tool gone,
+	// defer_loading stripped, the tool_reference history rewritten to its
+	// eager equivalent, and the tool-search betas dropped while other betas
+	// survive. The body keeps the 2026-10-20 Claude Desktop shape: a
+	// tool_reference part in an assistant turn after tool use.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model_override: None,
+		moderation: None,
+	});
+	let result = process_toolsearch_messages_with_beta(
+		&provider,
+		toolsearch_body("gpt-4o", false),
+		Some("tool-search-tool-2025-10-19,context-1m-2025-08-07"),
+	)
+	.await
+	.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("downgraded request must convert, got {result:?}");
+	};
+	let beta = request
+		.headers()
+		.get("anthropic-beta")
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or_default()
+		.to_string();
+	assert!(
+		!beta.contains("tool-search-tool") && !beta.contains("advanced-tool-use"),
+		"tool-search betas must be dropped on downgrade: {beta}"
+	);
+	assert!(
+		beta.contains("context-1m-2025-08-07"),
+		"unrelated betas must survive the downgrade: {beta}"
+	);
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("tool_search"),
+		"tool_search must be gone from the converted body: {rendered}"
+	);
+	assert!(
+		!rendered_str.contains("defer_loading"),
+		"defer_loading must be stripped so tools load upfront: {rendered}"
+	);
+	assert!(
+		!rendered_str.contains("tool_reference"),
+		"deferred-tool history plumbing must be rewritten, not forwarded: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("get_weather"),
+		"the real tool must survive the downgrade: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn desktop_shaped_toolsearch_downgrades_on_anthropic_wire_streaming() {
+	// The production failure shape (2026-10-20): Claude Desktop, streaming,
+	// non-verified model, tool_reference history — served over the
+	// Anthropic Messages wire (Fireworks GLM). The downgrade must complete
+	// on the SSE path too: the rendered upstream body carries no tool_search
+	// server tool, no defer_loading, and no tool_reference plumbing, while
+	// ordinary history survives.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let mut body = toolsearch_body("glm-5p3", true);
+	body["messages"] = json!([
+		{"role": "user", "content": "list the widgets"},
+		{"role": "assistant", "content": [
+			{"type": "tool_use", "id": "toolu_9", "name": "get_weather", "input": {"city": "Rome"}},
+			{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+		]},
+		{"role": "user", "content": [
+			{"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+				{"type": "text", "text": "18C"},
+				{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+			]}
+		]}
+	]);
+	let result =
+		process_toolsearch_messages_with_beta(&provider, body, Some("advanced-tool-use-2025-11-20"))
+			.await
+			.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("desktop-shaped streaming request must downgrade and pass, got {result:?}");
+	};
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("tool_search")
+			&& !rendered_str.contains("tool_reference")
+			&& !rendered_str.contains("defer_loading"),
+		"anthropic-wire render must be fully downgraded: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("toolu_9"),
+		"ordinary tool history must survive: {rendered}"
+	);
+	assert!(
+		rendered.get("stream").and_then(Value::as_bool) == Some(true),
+		"streaming intent must survive: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn native_search_round_history_on_unverified_model_downgrades() {
+	// Mid-conversation model switch: the history replays a native search
+	// round (server_tool_use + tool_search_tool_result) from an earlier
+	// Anthropic-model turn while the selected model is unverified. Before
+	// the 2026-10-20 fix these blocks were undetected and reached the
+	// upstream verbatim (production: Fireworks 400 on unknown content
+	// types); now the whole round is rewritten away and the embedded
+	// definition is hoisted into the eager tools.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let body = json!({
+		"model": "glm-5p3",
+		"max_tokens": 64,
+		"messages": [
+			{"role": "user", "content": "find a tool for that"},
+			{"role": "assistant", "content": [
+				{"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {"query": "widgets"}},
+				{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+					{
+						"type": "tool_reference",
+						"tool_name": "mcp__example__list_widgets",
+						"description": "List widgets",
+						"input_schema": {"type": "object"}
+					}
+				]},
+				{"type": "text", "text": "found it"}
+			]}
+		],
+		"tools": [
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object"},
+				"defer_loading": true
+			}
+		]
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("search-round history on an unverified model must downgrade, got {result:?}");
+	};
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("server_tool_use") && !rendered_str.contains("tool_search_tool_result"),
+		"search-round blocks must not reach the upstream: {rendered}"
+	);
+	assert!(
+		rendered["tools"]
+			.as_array()
+			.expect("tools survive")
+			.iter()
+			.any(|t| t["name"].as_str() == Some("mcp__example__list_widgets")),
+		"embedded definition must be hoisted into the eager tools: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn toolsearch_env_absent_downgrades_gracefully() {
+	// Absent allowlist = no model verified = every Tool Search request is
+	// downgraded (feature degrades gracefully; nothing fails hard). This is
+	// the rollback posture: unset the env and the flag-flipped clients keep
+	// working with upfront tool loading — including the Desktop-shaped
+	// tool_reference history.
+	let _env = ScopedToolSearchEnv::allow("").await;
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model_override: None,
+		moderation: None,
+	});
+	let result = process_toolsearch_messages(&provider, toolsearch_body("gpt-4o", false))
+		.await
+		.unwrap();
+	assert!(
+		matches!(result, RequestResult::Success { .. }),
+		"env absent must downgrade instead of rejecting: {result:?}"
+	);
+}
+
+#[tokio::test]
+async fn ordinary_tools_request_to_bedrock_converse_still_converts() {
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
+	}));
+	let body = json!({
+		"model": "anthropic.claude-sonnet-4-5-v1:0",
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "weather in Rome?"}],
+		"tools": [
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+			},
+			{"type": "web_search_20250305", "name": "web_search"}
+		]
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	assert!(
+		matches!(result, RequestResult::Success { .. }),
+		"ordinary tools must keep converting as before, got {result:?}"
+	);
+}
+
+#[test]
+fn bedrock_native_transport_qualifies_for_tool_search_guard() {
+	fn bedrock(transport: bedrock::BedrockTransport) -> AIProvider {
+		AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+			model_override: None,
+			region: strng::new("eu-west-1"),
+			guardrail_identifier: None,
+			guardrail_version: None,
+			endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+			transport,
+		}))
+	}
+
+	// Converse and (implicitly) Mantle legs never qualify: failover from a
+	// native backend onto them must keep hitting the strict guard.
+	assert!(!bedrock(bedrock::BedrockTransport::Converse).provider_serves_native_tool_search());
+
+	// A native-messages backend qualifies — Runtime InvokeModel is the AWS
+	// documented Tool Search surface — so genuine Tool Search shapes are
+	// served, not rejected.
+	assert!(bedrock(bedrock::BedrockTransport::NativeMessages).provider_serves_native_tool_search());
+}
+
+#[test]
+fn bedrock_native_transport_serves_messages_format_on_runtime() {
+	fn bedrock(transport: bedrock::BedrockTransport) -> AIProvider {
+		AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+			model_override: None,
+			region: strng::new("eu-west-1"),
+			guardrail_identifier: None,
+			guardrail_version: None,
+			endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+			transport,
+		}))
+	}
+
+	let native = bedrock(bedrock::BedrockTransport::NativeMessages);
+	// Messages input rides the native passthrough translation.
+	assert_eq!(
+		native
+			.chat_translation(
+				InputFormat::Messages,
+				"global.anthropic.claude-opus-5-5",
+				None
+			)
+			.unwrap()
+			.output,
+		ChatFormat::AnthropicMessages
+	);
+	// Responses input still falls back to Converse (no Responses→Messages
+	// conversion exists; failing closed to the proven translation).
+	assert_eq!(
+		native
+			.chat_translation(
+				InputFormat::Responses,
+				"global.anthropic.claude-opus-5-5",
+				None
+			)
+			.unwrap()
+			.output,
+		ChatFormat::BedrockConverse
+	);
 }

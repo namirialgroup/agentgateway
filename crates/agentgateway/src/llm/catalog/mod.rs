@@ -379,24 +379,40 @@ impl CatalogSnapshot {
 		let breakdown = rates.breakdown(&usage);
 		let cost = CostBreakdown::from(&breakdown);
 		let cost_rates = CostRates::from(&rates);
+		// A definitive estimate must never silently price an authoritative 1h
+		// write class at the 5m rate: when the split exists but the card has
+		// no 1h rate, keep the compatible fallback total but surface a
+		// dedicated status (metric label + warning) instead of "exact".
+		let one_h_fallback =
+			usage.cache_write_1h > 0 && prices_cache_write && rates.cache_write_1h.is_none();
+		let final_status = if one_h_fallback {
+			CostLookupStatus::Partial1hFallback
+		} else {
+			CostLookupStatus::Exact
+		};
 		crate::proxy::dtrace::pol_event!(
 			TRACE_POLICY_KIND,
-			crate::proxy::dtrace::Severity::Info,
+			if one_h_fallback {
+				crate::proxy::dtrace::Severity::Warn
+			} else {
+				crate::proxy::dtrace::Severity::Info
+			},
 			details = serde_json::json!({
 				"provider": provider,
 				"model": model,
-				"status": status_name(CostLookupStatus::Exact),
+				"status": status_name(final_status),
 				"cacheTokenConvention": cache_convention_name(convention),
 				"contextTokens": context_tokens,
 				"pricesCacheRead": prices_cache_read,
 				"pricesCacheWrite": prices_cache_write,
+				"cacheWrite1hFallbackTokens": if one_h_fallback { Some(usage.cache_write_1h) } else { None },
 				"usage": &usage,
 				"rates": cost_rates,
 				"cost": cost,
 			}),
 		);
 		CostProjection {
-			status: CostLookupStatus::Exact,
+			status: final_status,
 			cost: Some(breakdown),
 			cost_rates: Some(cost_rates),
 		}
@@ -682,6 +698,12 @@ fn watch_catalog_files(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, EncodeLabelValue)]
 pub enum CostLookupStatus {
 	Exact,
+	/// Priced, but the response carried an authoritative 1h cache-write class
+	/// while the effective card has no 1h rate: the 1h tokens fell back to the
+	/// 5m write rate. The total is emitted for compatibility but is NOT a
+	/// definitive 1h price — operators see a dedicated status/label and a
+	/// warning instead of a silent under-estimate.
+	Partial1hFallback,
 	Unpriced,
 	#[default]
 	Missing,
@@ -691,6 +713,7 @@ pub enum CostLookupStatus {
 fn status_name(status: CostLookupStatus) -> &'static str {
 	match status {
 		CostLookupStatus::Exact => "exact",
+		CostLookupStatus::Partial1hFallback => "partial-1h-fallback",
 		CostLookupStatus::Unpriced => "unpriced",
 		CostLookupStatus::Missing => "missing",
 		CostLookupStatus::NoCatalog => "noCatalog",
@@ -747,10 +770,25 @@ fn usage_for(
 		.saturating_sub(reasoning)
 		.saturating_sub(output_audio);
 
+	// Extended-TTL (1h) cache-write subcount, from the provider-reported TTL
+	// split. Only tracked when cache writes are priced — mirroring the
+	// aggregate zeroing above — and clamped to the (post-convention) write
+	// total. When the catalog lacks a distinct 1h rate, `breakdown` falls
+	// back to the plain cache-write rate, so this subcount is inert there.
+	let cache_write_1h = if prices_cache_write {
+		resp
+			.cache_creation_1h_input_tokens
+			.unwrap_or(0)
+			.min(cache_write)
+	} else {
+		0
+	};
+
 	Usage {
 		input,
 		cache_read,
 		cache_write,
+		cache_write_1h,
 		output,
 		reasoning,
 		input_audio,
@@ -822,6 +860,8 @@ mod tests {
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			response: LLMResponse {
 				input_tokens: Some(1_000_000),
@@ -930,6 +970,81 @@ mod tests {
 		assert_eq!(u.input, 800);
 		assert_eq!(u.cache_read, 0);
 		assert_eq!(u.cache_write, 200);
+	}
+
+	#[test]
+	fn usage_carries_1h_write_split_when_priced() {
+		// Stage 2026-11-02: native Anthropic responses report the TTL split
+		// (ephemeral_5m/ephemeral_1h); the inline usage must carry the 1h
+		// subcount so repricing can apply the distinct rate.
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(6841),
+			cache_creation_5m_input_tokens: Some(0),
+			cache_creation_1h_input_tokens: Some(6841),
+			output_tokens: Some(100),
+			..Default::default()
+		};
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, true);
+		assert_eq!(u.cache_write, 6841);
+		assert_eq!(u.cache_write_1h, 6841);
+	}
+
+	#[test]
+	fn usage_1h_split_clamped_and_zeroed_consistently_with_writes() {
+		// Split larger than the aggregate is clamped; when cache writes are
+		// NOT priced the subcount is zeroed together with the aggregate.
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(500),
+			cache_creation_1h_input_tokens: Some(900),
+			..Default::default()
+		};
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, true);
+		assert_eq!(u.cache_write, 500);
+		assert_eq!(u.cache_write_1h, 500, "clamped to the write total");
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, false);
+		assert_eq!(u.cache_write, 0);
+		assert_eq!(u.cache_write_1h, 0, "zeroed when writes are unpriced");
+	}
+
+	#[test]
+	fn usage_split_absent_when_provider_reports_aggregate_only() {
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(500),
+			..Default::default()
+		};
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, true);
+		assert_eq!(u.cache_write_1h, 0);
+	}
+
+	#[test]
+	fn builtin_global_opus_5_5_card_carries_the_1h_write_rate() {
+		// F2: the effective Bedrock global card must price 1h writes at the
+		// distinct rate. Stage 2026-11-02 measured the aggregate-rate
+		// fallback underpricing the live 6841-token 1h row by exactly
+		// $0.020523 while this field was absent from the card.
+		let catalog = model::from_json(BUILTIN_CATALOG_JSON).expect("builtin catalog parses");
+		let global = &catalog.providers["aws.bedrock"].models["global.anthropic.claude-opus-5-5"];
+		assert_eq!(
+			global.rates.cache_write,
+			Some(model::Money::parse("5").unwrap())
+		);
+		assert_eq!(
+			global.rates.cache_write_1h,
+			Some(model::Money::parse("8").unwrap())
+		);
+		// The no-prefix Bedrock id carries the same verified card.
+		let no_prefix = &catalog.providers["aws.bedrock"].models["anthropic.claude-opus-5-5"];
+		assert_eq!(
+			no_prefix.rates.cache_write_1h,
+			Some(model::Money::parse("8").unwrap())
+		);
+		// Regional-prefixed variants (4.4 base card) are intentionally left
+		// on the 5m-only fallback: their 1h rate is not Stage-verified.
+		let eu = &catalog.providers["aws.bedrock"].models["eu.anthropic.claude-opus-5-5"];
+		assert_eq!(eu.rates.cache_write_1h, None);
 	}
 
 	#[test]
@@ -1110,6 +1225,91 @@ mod tests {
 		);
 		assert_eq!(status, CostLookupStatus::Exact);
 		assert_eq!(cost, Some(2.0));
+	}
+
+	#[test]
+	fn one_h_usage_without_a_1h_rate_is_partial_not_exact() {
+		// F2: an authoritative 1h write class against a card with NO 1h rate
+		// must not be reported as a silent, definitive "exact" estimate. The
+		// compatible fallback total is still emitted (pre-F2 arithmetic), but
+		// the status is the dedicated partial marker (metric label + warning).
+		let snap = CatalogSnapshot::parse(
+			r#"{"providers":{"openai":{"models":{
+				"my-model":{"rates":{"input":"4","output":"20","cacheRead":"0.2","cacheWrite":"5"}}
+			}}}}"#,
+		)
+		.unwrap();
+		let resp = LLMResponse {
+			input_tokens: Some(23),
+			output_tokens: Some(7),
+			cache_creation_input_tokens: Some(6841),
+			cache_creation_5m_input_tokens: Some(0),
+			cache_creation_1h_input_tokens: Some(6841),
+			..Default::default()
+		};
+		let (cost, status) = snap.price(
+			"openai",
+			"my-model",
+			&resp,
+			CacheTokenConvention::InputExcludesCache,
+		);
+		assert_eq!(status, CostLookupStatus::Partial1hFallback);
+		// 23×4µ + 6841×5µ + 7×20µ = $0.034437 — the compatible fallback value.
+		assert_eq!(cost, Some(0.034437));
+	}
+
+	#[test]
+	fn one_h_usage_with_a_1h_rate_stays_exact() {
+		let snap = CatalogSnapshot::parse(
+			r#"{"providers":{"openai":{"models":{
+				"my-model":{"rates":{"input":"4","output":"20","cacheRead":"0.2","cacheWrite":"5","cacheWrite1h":"8"}}
+			}}}}"#,
+		)
+		.unwrap();
+		let resp = LLMResponse {
+			input_tokens: Some(23),
+			output_tokens: Some(7),
+			cache_creation_input_tokens: Some(6841),
+			cache_creation_5m_input_tokens: Some(0),
+			cache_creation_1h_input_tokens: Some(6841),
+			..Default::default()
+		};
+		let (cost, status) = snap.price(
+			"openai",
+			"my-model",
+			&resp,
+			CacheTokenConvention::InputExcludesCache,
+		);
+		assert_eq!(status, CostLookupStatus::Exact);
+		// 23×4µ + 6841×8µ + 7×20µ = $0.054960.
+		assert_eq!(cost, Some(0.05496));
+	}
+
+	#[test]
+	fn no_one_h_usage_stays_exact_even_without_a_1h_rate() {
+		// Backward compatibility: catalogs where no 1h usage ever appears are
+		// unaffected by the partial marker.
+		let snap = CatalogSnapshot::parse(
+			r#"{"providers":{"openai":{"models":{
+				"my-model":{"rates":{"input":"4","output":"20","cacheWrite":"5"}}
+			}}}}"#,
+		)
+		.unwrap();
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(500),
+			cache_creation_5m_input_tokens: Some(500),
+			..Default::default()
+		};
+		let (cost, status) = snap.price(
+			"openai",
+			"my-model",
+			&resp,
+			CacheTokenConvention::InputExcludesCache,
+		);
+		assert_eq!(status, CostLookupStatus::Exact);
+		// 1000×4µ + 500×5µ = $0.0065.
+		assert_eq!(cost, Some(0.0065));
 	}
 
 	#[test]
