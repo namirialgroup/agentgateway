@@ -1962,6 +1962,25 @@ pub(crate) fn backend_with_policies_from_proto(
 							})
 						},
 						Some(provider::Provider::Bedrock(bedrock)) => {
+							// Transport resolution matches the RAW proto value
+							// (prost stores enum fields as i32): unset (0) is
+							// the fail-closed Converse default, known values
+							// map 1:1, and an UNRECOGNIZED non-zero value is
+							// rejected — never silently downgraded to
+							// Converse (a downgrade would serve a configured
+							// InvokeModel backend over a surface that cannot
+							// carry its requests, e.g. K3.1 temperature on
+							// Converse).
+							let transport = match bedrock.transport {
+								0 => llm::bedrock::BedrockTransport::Converse,
+								1 => llm::bedrock::BedrockTransport::NativeMessages,
+								2 => llm::bedrock::BedrockTransport::OpenAIInvoke,
+								other => {
+									return Err(ProtoError::Generic(format!(
+										"Bedrock transport value {other} is not supported by this agentgateway build; refusing to fail-open to Converse — deploy a matching agentgateway/controller version"
+									)));
+								},
+							};
 							AIProvider::bedrock(llm::bedrock::Provider {
 								model_override: bedrock.model.as_deref().map(strng::new),
 								region: strng::new(&bedrock.region),
@@ -1979,14 +1998,7 @@ pub(crate) fn backend_with_policies_from_proto(
 									},
 									_ => llm::bedrock::BedrockEndpointPreference::RuntimePreferred,
 								},
-								// Unset proto enum resolves to CONVERSE (first
-								// variant): the fail-closed default transport.
-								transport: match bedrock.transport() {
-									proto::agent::ai_backend::BedrockTransport::NativeMessages => {
-										llm::bedrock::BedrockTransport::NativeMessages
-									},
-									_ => llm::bedrock::BedrockTransport::Converse,
-								},
+								transport,
 							})
 						},
 						Some(provider::Provider::Azure(azure)) => {

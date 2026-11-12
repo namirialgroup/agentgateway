@@ -971,6 +971,7 @@ async fn streaming_response_is_forwarded_byte_for_byte() {
 				tool_name_map: None,
 				namespaces: None,
 				bedrock_native: false,
+				bedrock_openai_invoke: false,
 			},
 		)
 		.into_body()

@@ -575,8 +575,11 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 
 		// Unset resolves to CONVERSE: the fail-closed default transport.
 		transport := api.AIBackend_BEDROCK_TRANSPORT_CONVERSE
-		if llm.Bedrock.Transport == agentgateway.BedrockTransportNativeMessages {
+		switch llm.Bedrock.Transport {
+		case agentgateway.BedrockTransportNativeMessages:
 			transport = api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES
+		case agentgateway.BedrockTransportOpenAIInvoke:
+			transport = api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE
 		}
 
 		provider.Provider = &api.AIBackend_Provider_Bedrock{

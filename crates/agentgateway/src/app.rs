@@ -426,9 +426,9 @@ mod tests {
 			move || {
 				policy_events.lock().unwrap().push("collected");
 				let policy_events = Arc::clone(&policy_events);
-			vec![Box::pin(async move {
-				policy_events.lock().unwrap().push("shutdown");
-			}) as ShutdownPolicy]
+				vec![Box::pin(async move {
+					policy_events.lock().unwrap().push("shutdown");
+				}) as ShutdownPolicy]
 			},
 		));
 

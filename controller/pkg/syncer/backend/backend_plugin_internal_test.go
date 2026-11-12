@@ -109,7 +109,7 @@ func TestBedrockTransportWireCompatibility(t *testing.T) {
 	}
 
 	// ...and an unknown enum number decodes without error and is rejected by
-	// the syncer mapping (only the exact NATIVE_MESSAGES value enables native).
+	// the syncer mapping (only the exact known values map 1:1).
 	unknown, err := proto.Marshal(&api.AIBackend_Bedrock{Model: proto.String("m"), Transport: api.AIBackend_BedrockTransport(99)})
 	if err != nil {
 		t.Fatal(err)
@@ -121,13 +121,28 @@ func TestBedrockTransportWireCompatibility(t *testing.T) {
 	if unknownDecoded.GetTransport() != api.AIBackend_BedrockTransport(99) {
 		t.Fatalf("unknown enum number should be preserved for inspection, got %v", unknownDecoded.GetTransport())
 	}
-	// The mapping rule applied by backend_plugin.go: anything that is not
-	// exactly NATIVE_MESSAGES resolves to CONVERSE (fail-closed).
+	// The mapping rule applied by backend_plugin.go: NATIVE_MESSAGES and
+	// OPENAI_INVOKE map 1:1; anything else resolves to CONVERSE (fail-closed).
 	got := api.AIBackend_BEDROCK_TRANSPORT_CONVERSE
-	if unknownDecoded.GetTransport() == api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES {
+	switch unknownDecoded.GetTransport() {
+	case api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES:
 		got = api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES
+	case api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE:
+		got = api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE
 	}
 	if got != api.AIBackend_BEDROCK_TRANSPORT_CONVERSE {
 		t.Fatalf("unknown enum number %v must fail closed to CONVERSE, got %v", unknownDecoded.GetTransport(), got)
+	}
+
+	// OPENAI_INVOKE maps 1:1 through the syncer mapping.
+	openaiInvoke := api.AIBackend_BEDROCK_TRANSPORT_CONVERSE
+	switch api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE {
+	case api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES:
+		openaiInvoke = api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES
+	case api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE:
+		openaiInvoke = api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE
+	}
+	if openaiInvoke != api.AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE {
+		t.Fatalf("OPENAI_INVOKE must map 1:1, got %v", openaiInvoke)
 	}
 }

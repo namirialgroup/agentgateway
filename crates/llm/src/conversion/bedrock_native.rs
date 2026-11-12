@@ -838,6 +838,7 @@ mod tests {
 				provider_state: None,
 				safeguards: None,
 				transport_hints: TransportHints {
+					bedrock_openai_invoke: false,
 					bedrock_native_messages: true,
 					cache_1h_requested: false,
 				},
@@ -940,6 +941,7 @@ mod tests {
 				provider_state: None,
 				safeguards: None,
 				transport_hints: TransportHints {
+					bedrock_openai_invoke: false,
 					bedrock_native_messages: true,
 					cache_1h_requested: false,
 				},
@@ -991,6 +993,7 @@ mod tests {
 				provider_state: None,
 				safeguards: None,
 				transport_hints: TransportHints {
+					bedrock_openai_invoke: false,
 					bedrock_native_messages: true,
 					cache_1h_requested: false,
 				},
@@ -1065,6 +1068,7 @@ mod tests {
 				provider_state: None,
 				safeguards: None,
 				transport_hints: TransportHints {
+					bedrock_openai_invoke: false,
 					bedrock_native_messages: true,
 					cache_1h_requested: false,
 				},
@@ -1188,6 +1192,7 @@ mod tests {
 				provider_state: None,
 				safeguards: None,
 				transport_hints: TransportHints {
+					bedrock_openai_invoke: false,
 					bedrock_native_messages: true,
 					cache_1h_requested: false,
 				},

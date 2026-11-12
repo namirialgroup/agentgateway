@@ -1906,6 +1906,10 @@ message AIBackend {
   enum BedrockTransport {
     BEDROCK_TRANSPORT_CONVERSE = 0;
     BEDROCK_TRANSPORT_NATIVE_MESSAGES = 1;
+    // OpenAI Chat Completions body over Runtime InvokeModel /
+    // InvokeModelWithResponseStream — for OpenWeight models whose Converse
+    // surface is deficient (e.g. Kimi K3.1). Runtime-only, never Converse.
+    BEDROCK_TRANSPORT_OPENAI_INVOKE = 2;
   }
   message AzureOpenAI {
     optional string model = 1;

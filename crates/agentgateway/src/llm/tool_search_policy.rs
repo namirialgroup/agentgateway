@@ -79,7 +79,10 @@ pub struct ToolSearchPolicyDoc {
 impl ToolSearchPolicyDoc {
 	pub fn parse(bytes: &[u8]) -> Result<ToolSearchPolicyDoc, String> {
 		if bytes.len() > MAX_POLICY_BYTES {
-			return Err(format!("policy artifact exceeds {} bytes", MAX_POLICY_BYTES));
+			return Err(format!(
+				"policy artifact exceeds {} bytes",
+				MAX_POLICY_BYTES
+			));
 		}
 		#[derive(Deserialize)]
 		#[serde(deny_unknown_fields)]
@@ -98,12 +101,15 @@ impl ToolSearchPolicyDoc {
 		let default_mode = PolicyMode::parse_str(&raw.default_mode)
 			.ok_or_else(|| format!("invalid default_mode: {}", raw.default_mode))?;
 		if raw.models.len() > MAX_POLICY_MODELS {
-			return Err(format!("policy artifact lists more than {} models", MAX_POLICY_MODELS));
+			return Err(format!(
+				"policy artifact lists more than {} models",
+				MAX_POLICY_MODELS
+			));
 		}
 		let mut models = BTreeMap::new();
 		for (alias, mode) in raw.models {
-			let mode = PolicyMode::parse_str(&mode)
-				.ok_or_else(|| format!("invalid mode for {alias}: {mode}"))?;
+			let mode =
+				PolicyMode::parse_str(&mode).ok_or_else(|| format!("invalid mode for {alias}: {mode}"))?;
 			models.insert(alias, mode);
 		}
 		Ok(ToolSearchPolicyDoc {
@@ -193,7 +199,11 @@ pub fn tool_search_decision(env_allows_native: bool, model: &str) -> ToolSearchD
 		// Not configured: exact env-only behavior (back-compat).
 		return ToolSearchDecision {
 			allow_native: env_allows_native,
-			reason: if env_allows_native { "env-allowlist" } else { "env-allowlist-miss" },
+			reason: if env_allows_native {
+				"env-allowlist"
+			} else {
+				"env-allowlist-miss"
+			},
 			policy_revision: None,
 		};
 	};
@@ -303,7 +313,9 @@ pub fn spawn_policy_refresher() {
 					// Keep last-known-good; if none was ever loaded, stay
 					// fail-closed (native disabled) — never widen. Requests
 					// keep flowing through the translation downgrade.
-					tracing::warn!("tool search policy refresh kept last-known-good (or stays fail-closed until first success): {error}");
+					tracing::warn!(
+						"tool search policy refresh kept last-known-good (or stays fail-closed until first success): {error}"
+					);
 				},
 			}
 			// ±20% jitter so many replicas do not synchronize on the CP.
@@ -378,8 +390,8 @@ mod tests {
 		let Ok(path) = std::env::var("TOOLSEARCH_POLICY_FIXTURE") else {
 			return;
 		};
-		let bytes = std::fs::read(&path)
-			.unwrap_or_else(|error| panic!("fixture {path} unreadable: {error}"));
+		let bytes =
+			std::fs::read(&path).unwrap_or_else(|error| panic!("fixture {path} unreadable: {error}"));
 		let doc = ToolSearchPolicyDoc::parse(&bytes)
 			.unwrap_or_else(|error| panic!("generated artifact must parse: {error}"));
 		assert!(!doc.revision.trim().is_empty());
@@ -432,8 +444,8 @@ mod tests {
 	#[tokio::test]
 	async fn rotation_crossover_stays_fail_closed_then_recovers() {
 		use std::net::SocketAddr;
-		use std::sync::atomic::{AtomicBool, Ordering};
 		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
 		use tokio::io::{AsyncReadExt, AsyncWriteExt};
 		let _guard = crate::config::lock_env_for_tests_async().await;
 		clear_policy();
@@ -474,13 +486,18 @@ mod tests {
 		set_policy_source_configured();
 		assert!(refresh_policy_once(&url).await.is_err());
 		let decision = tool_search_decision(true, "sonnet");
-		assert!(!decision.allow_native, "crossover must not widen to env-only");
+		assert!(
+			!decision.allow_native,
+			"crossover must not widen to env-only"
+		);
 		assert_eq!(decision.reason, "policy-source-unavailable");
 
 		// Rotation completes: one good fetch restores governed resolution
 		// (no restart involved).
 		serving_valid.store(true, Ordering::SeqCst);
-		let doc = refresh_policy_once(&url).await.expect("valid fetch after rotation");
+		let doc = refresh_policy_once(&url)
+			.await
+			.expect("valid fetch after rotation");
 		assert_eq!(doc.revision, "v1");
 		let decision = tool_search_decision(true, "sonnet");
 		assert!(decision.allow_native);
@@ -518,7 +535,8 @@ mod tests {
 						body_ok
 					)
 				} else {
-					"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+					"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+						.to_string()
 				};
 				let _ = socket.write_all(response.as_bytes()).await;
 				let _ = socket.shutdown().await;
@@ -585,12 +603,9 @@ mod tests {
 		// down entirely (connection up, HTTP 500).
 		let body: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(rev_a.clone()));
 		let serve_ok = Arc::new(AtomicBool::new(true));
-		let listener = tokio::net::TcpListener::bind(SocketAddr::from((
-			[127, 0, 0, 1],
-			0,
-		)))
-		.await
-		.unwrap();
+		let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+			.await
+			.unwrap();
 		let addr = listener.local_addr().unwrap();
 		{
 			let body = body.clone();
@@ -635,11 +650,17 @@ mod tests {
 		// model NOT yet listed in the artifact (e.g. a newly enabled route
 		// before the next publish) falls back to default auto -> env ceiling.
 		refresh_policy_once(&url).await.expect("rev-a installs");
-		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-a-2026-10-20");
+		assert_eq!(
+			current_policy().unwrap().revision,
+			"tsrev-demo-a-2026-10-20"
+		);
 		let g53 = tool_search_decision(false, "claude-gateway-fireworks-route-g53");
 		assert!(!g53.allow_native);
 		assert_eq!(g53.reason, "policy-eager");
-		assert_eq!(g53.policy_revision.as_deref(), Some("tsrev-demo-a-2026-10-20"));
+		assert_eq!(
+			g53.policy_revision.as_deref(),
+			Some("tsrev-demo-a-2026-10-20")
+		);
 		let unlisted = tool_search_decision(false, "claude-gateway-fireworks-route-g52");
 		assert!(!unlisted.allow_native);
 		assert_eq!(unlisted.reason, "policy-auto-env");
@@ -657,7 +678,10 @@ mod tests {
 		let g53 = tool_search_decision(false, "claude-gateway-fireworks-route-g53");
 		assert!(!g53.allow_native);
 		assert_eq!(g53.reason, "policy-eager");
-		assert_eq!(g53.policy_revision.as_deref(), Some("tsrev-demo-b-2026-10-20"));
+		assert_eq!(
+			g53.policy_revision.as_deref(),
+			Some("tsrev-demo-b-2026-10-20")
+		);
 
 		// Step 6: change ONLY the Flash route (g53f -> off); g53 is untouched.
 		*body.lock().unwrap() = rev_c.clone();
@@ -666,14 +690,20 @@ mod tests {
 		assert!(!flash.allow_native);
 		assert_eq!(flash.reason, "policy-off");
 		let g53 = tool_search_decision(false, "claude-gateway-fireworks-route-g53");
-		assert_eq!(g53.reason, "policy-eager", "g53 must be unchanged by the flash edit");
+		assert_eq!(
+			g53.reason, "policy-eager",
+			"g53 must be unchanged by the flash edit"
+		);
 		assert!(tool_search_decision(true, "claude-sonnet-5-5").allow_native);
 
 		// Step 7: an invalid artifact NEVER installs; last-known-good keeps
 		// serving rev-c semantics.
 		*body.lock().unwrap() = invalid.clone();
 		assert!(refresh_policy_once(&url).await.is_err());
-		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-c-2026-10-20");
+		assert_eq!(
+			current_policy().unwrap().revision,
+			"tsrev-demo-c-2026-10-20"
+		);
 		assert_eq!(
 			tool_search_decision(false, "claude-gateway-fireworks-route-g53f").reason,
 			"policy-off"
@@ -682,14 +712,20 @@ mod tests {
 		// Step 8: endpoint unavailable entirely — same last-known-good.
 		serve_ok.store(false, Ordering::SeqCst);
 		assert!(refresh_policy_once(&url).await.is_err());
-		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-c-2026-10-20");
+		assert_eq!(
+			current_policy().unwrap().revision,
+			"tsrev-demo-c-2026-10-20"
+		);
 		serve_ok.store(true, Ordering::SeqCst);
 
 		// Step 9: rollback re-publishes the exact prior approved bytes; the
 		// gateway applies them on the next refresh — still no restart.
 		*body.lock().unwrap() = rollback;
 		refresh_policy_once(&url).await.expect("rollback installs");
-		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-b-2026-10-20");
+		assert_eq!(
+			current_policy().unwrap().revision,
+			"tsrev-demo-b-2026-10-20"
+		);
 		assert_eq!(
 			tool_search_decision(false, "claude-gateway-fireworks-route-g53").reason,
 			"policy-eager"
@@ -697,7 +733,10 @@ mod tests {
 		// Step 10, final: native models unaffected end-to-end.
 		let sonnet = tool_search_decision(true, "claude-sonnet-5-5");
 		assert!(sonnet.allow_native);
-		assert_eq!(sonnet.policy_revision.as_deref(), Some("tsrev-demo-b-2026-10-20"));
+		assert_eq!(
+			sonnet.policy_revision.as_deref(),
+			Some("tsrev-demo-b-2026-10-20")
+		);
 
 		clear_policy();
 		match previous_allowlist {

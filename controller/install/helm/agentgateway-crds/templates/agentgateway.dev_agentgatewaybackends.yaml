@@ -259,6 +259,7 @@ spec:
                                     enum:
                                     - Converse
                                     - NativeMessages
+                                    - OpenAIInvoke
                                     type: string
                                 type: object
                                 x-kubernetes-validations:
@@ -7412,6 +7413,7 @@ spec:
                             enum:
                             - Converse
                             - NativeMessages
+                            - OpenAIInvoke
                             type: string
                         type: object
                         x-kubernetes-validations:

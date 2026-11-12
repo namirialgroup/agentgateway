@@ -361,6 +361,13 @@ struct ChatStreamContext {
 	/// AnthropicMessages, so the stream must be transcoded before the
 	/// Anthropic-native passthrough state machine sees it.
 	bedrock_native: bool,
+	/// The upstream speaks the Bedrock Runtime OpenAIInvoke transport
+	/// (`InvokeModelWithResponseStream` with an OpenAI Chat Completions body):
+	/// the response body is the AWS EventStream binary protocol even though
+	/// the selected chat format is OpenAICompletions, so each raw OpenAI
+	/// chunk must be re-framed as OpenAI SSE (with the `[DONE]` terminator)
+	/// before the OpenAI-compat stream translations see it.
+	bedrock_openai_invoke: bool,
 }
 
 /// Ordered chat conversion table.
@@ -595,6 +602,7 @@ fn render_bedrock_native_messages(
 		provider_state: None,
 		transport_hints: TransportHints {
 			bedrock_native_messages: true,
+			bedrock_openai_invoke: false,
 			cache_1h_requested: native.cache_1h_requested,
 		},
 	})
@@ -625,6 +633,24 @@ impl ChatTranslation {
 		ctx: &ChatRequestContext<'_>,
 	) -> Result<RenderedChatRequest, AIError> {
 		let body = match self.output {
+			// Bedrock OpenAIInvoke transport: the body is the OpenAI Chat
+			// Completions payload with transport-specific hygiene applied
+			// (history-side reasoning_content stripped, streaming usage
+			// guaranteed). Must run BEFORE the generic passthrough arm.
+			ChatFormat::OpenAICompletions
+				if matches!(
+					ctx.provider,
+					AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::OpenAIInvoke
+				) =>
+			{
+				let mut rendered = render_openai_completions(req, ctx)?;
+				rendered.body = conversion::bedrock_openai_invoke::prepare_invoke_body(&rendered.body)?;
+				rendered.transport_hints = TransportHints {
+					bedrock_openai_invoke: true,
+					..TransportHints::default()
+				};
+				return Ok(rendered);
+			},
 			ChatFormat::OpenAICompletions => return render_openai_completions(req, ctx),
 			ChatFormat::OpenAIResponses => render_openai_responses(req, ctx),
 			// Bedrock native Messages transport (Runtime InvokeModel): the
@@ -740,6 +766,38 @@ impl ChatTranslation {
 
 	fn stream(&self, resp: Response, ctx: ChatStreamContext) -> Response {
 		match self.output {
+			// Bedrock OpenAIInvoke transport: the upstream body is the AWS
+			// EventStream binary protocol carrying RAW OpenAI chunk JSON —
+			// re-frame it as OpenAI SSE (with the [DONE] terminator) before
+			// the standard per-input OpenAI-compat translations.
+			ChatFormat::OpenAICompletions if ctx.bedrock_openai_invoke => {
+				let resp = resp
+					.map(|b| conversion::bedrock_openai_invoke::transcode_stream_to_sse(b, ctx.buffer_limit));
+				match self.input {
+					InputFormat::Completions => {
+						conversion::completions::passthrough_stream(ctx.logger, ctx.log_content, resp)
+					},
+					InputFormat::Messages => resp.map(|b| {
+						conversion::completions::from_messages::translate_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+						)
+					}),
+					InputFormat::Responses => resp.map(|b| {
+						conversion::openai_compat::to_responses::translate_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+							ctx.namespaces,
+						)
+					}),
+					_ => resp,
+				}
+			},
+
 			ChatFormat::OpenAICompletions => match self.input {
 				InputFormat::Completions => {
 					conversion::completions::passthrough_stream(ctx.logger, ctx.log_content, resp)
@@ -3418,6 +3476,10 @@ impl AIProvider {
 					bedrock_native: matches!(
 						self,
 						AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+					),
+					bedrock_openai_invoke: matches!(
+						self,
+						AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::OpenAIInvoke
 					),
 				},
 			)

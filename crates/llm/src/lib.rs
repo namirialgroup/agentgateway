@@ -276,6 +276,11 @@ pub struct TransportHints {
 	/// transport (`InvokeModel`/`InvokeModelWithResponseStream`) — used for
 	/// the `gen_ai.provider.transport` telemetry attribute.
 	pub bedrock_native_messages: bool,
+	/// The upstream is the Bedrock Runtime OpenAIInvoke transport
+	/// (`InvokeModel`/`InvokeModelWithResponseStream` with an OpenAI Chat
+	/// Completions body) — used for the `gen_ai.provider.transport`
+	/// telemetry attribute.
+	pub bedrock_openai_invoke: bool,
 	/// The request carried at least one `cache_control` with `ttl: "1h"`.
 	/// Together with the provider-reported cache-write aggregate this makes
 	/// the 5m/1h attribution provable or explicitly ambiguous (never

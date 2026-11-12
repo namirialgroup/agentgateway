@@ -1883,14 +1883,20 @@ impl Drop for DropOnLog {
 				),
 				// Not part of official semconv: distinguishes the upstream
 				// wire transport for the same provider (Bedrock Converse vs
-				// native Anthropic Messages over InvokeModel) so accounting
-				// attempts are attributable by provider, model AND transport.
+				// native Anthropic Messages vs OpenAIInvoke, all over
+				// InvokeModel) so accounting attempts are attributable by
+				// provider, model AND transport.
 				(
 					"gen_ai.provider.transport",
 					log.llm_request.as_ref().and_then(|l| {
 						l.transport_hints
 							.bedrock_native_messages
 							.then_some(ValueBag::from("native-messages"))
+							.or_else(|| {
+								l.transport_hints
+									.bedrock_openai_invoke
+									.then_some(ValueBag::from("openai-invoke"))
+							})
 							.or_else(|| {
 								(l.provider.as_str() == "aws.bedrock").then_some(ValueBag::from("converse"))
 							})

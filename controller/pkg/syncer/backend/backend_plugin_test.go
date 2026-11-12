@@ -631,6 +631,24 @@ func TestBuildAIBackend(t *testing.T) {
 			},
 		},
 		{
+			name: "Valid Bedrock backend with OpenAIInvoke transport",
+			backend: &agentgateway.AgentgatewayBackend{
+				Name:      "kimi-k31-openaiinvoke",
+				Namespace: "test-ns",
+				Spec: agentgateway.AgentgatewayBackendSpec{
+					AI: &agentgateway.AIBackend{
+						LLM: &agentgateway.LLMProvider{
+							Bedrock: &agentgateway.BedrockConfig{
+								Model:     new("global.moonshotai.kimi-k3.1"),
+								Region:    "eu-west-1",
+								Transport: agentgateway.BedrockTransportOpenAIInvoke,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "OpenAI backend with secret reference auth",
 			backend: &agentgateway.AgentgatewayBackend{
 				Name:      "openai-secret-backend",

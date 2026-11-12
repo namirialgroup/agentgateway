@@ -2518,6 +2518,10 @@ type AIBackend_BedrockTransport int32
 const (
 	AIBackend_BEDROCK_TRANSPORT_CONVERSE        AIBackend_BedrockTransport = 0
 	AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES AIBackend_BedrockTransport = 1
+	// OpenAI Chat Completions body over Runtime InvokeModel /
+	// InvokeModelWithResponseStream — for OpenWeight models whose Converse
+	// surface is deficient (e.g. Kimi K3.1). Runtime-only, never Converse.
+	AIBackend_BEDROCK_TRANSPORT_OPENAI_INVOKE AIBackend_BedrockTransport = 2
 )
 
 // Enum value maps for AIBackend_BedrockTransport.
@@ -2525,10 +2529,12 @@ var (
 	AIBackend_BedrockTransport_name = map[int32]string{
 		0: "BEDROCK_TRANSPORT_CONVERSE",
 		1: "BEDROCK_TRANSPORT_NATIVE_MESSAGES",
+		2: "BEDROCK_TRANSPORT_OPENAI_INVOKE",
 	}
 	AIBackend_BedrockTransport_value = map[string]int32{
 		"BEDROCK_TRANSPORT_CONVERSE":        0,
 		"BEDROCK_TRANSPORT_NATIVE_MESSAGES": 1,
+		"BEDROCK_TRANSPORT_OPENAI_INVOKE":   2,
 	}
 )
 
@@ -19415,7 +19421,7 @@ const file_resource_proto_rawDesc = "" +
 	"\x11agent_runtime_arn\x18\x01 \x01(\tR\x0fagentRuntimeArn\x12!\n" +
 	"\tqualifier\x18\x02 \x01(\tH\x00R\tqualifier\x88\x01\x01B\f\n" +
 	"\n" +
-	"_qualifier\"\xc7#\n" +
+	"_qualifier\"\xec#\n" +
 	"\tAIBackend\x12[\n" +
 	"\x0fprovider_groups\x18\x01 \x03(\v22.agentgateway.dev.resource.AIBackend.ProviderGroupR\x0eproviderGroups\x1a6\n" +
 	"\fHostOverride\x12\x12\n" +
@@ -19523,10 +19529,11 @@ const file_resource_proto_rawDesc = "" +
 	"-BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_PREFERRED\x10\x00\x12+\n" +
 	"'BEDROCK_ENDPOINT_PREFERENCE_MANTLE_ONLY\x10\x01\x12,\n" +
 	"(BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_ONLY\x10\x02\x120\n" +
-	",BEDROCK_ENDPOINT_PREFERENCE_MANTLE_PREFERRED\x10\x03\"Y\n" +
+	",BEDROCK_ENDPOINT_PREFERENCE_MANTLE_PREFERRED\x10\x03\"~\n" +
 	"\x10BedrockTransport\x12\x1e\n" +
 	"\x1aBEDROCK_TRANSPORT_CONVERSE\x10\x00\x12%\n" +
-	"!BEDROCK_TRANSPORT_NATIVE_MESSAGES\x10\x01\"-\n" +
+	"!BEDROCK_TRANSPORT_NATIVE_MESSAGES\x10\x01\x12#\n" +
+	"\x1fBEDROCK_TRANSPORT_OPENAI_INVOKE\x10\x02\"-\n" +
 	"\x11AzureResourceType\x12\v\n" +
 	"\aOPEN_AI\x10\x00\x12\v\n" +
 	"\aFOUNDRY\x10\x01\"\xa4\x01\n" +

@@ -612,6 +612,13 @@ const (
 	// BedrockTransportNativeMessages passes Anthropic Messages bodies through
 	// natively to Bedrock Runtime InvokeModel/InvokeModelWithResponseStream.
 	BedrockTransportNativeMessages BedrockTransport = "NativeMessages"
+	// BedrockTransportOpenAIInvoke sends the OpenAI Chat Completions body
+	// through Bedrock Runtime InvokeModel/InvokeModelWithResponseStream —
+	// the native surface for OpenWeight models whose Converse API cannot
+	// serve them (e.g. Kimi K3.1: Converse rejects temperature and has no
+	// explicit caching). Runtime-only; the proxy never fails this transport
+	// open to Converse.
+	BedrockTransportOpenAIInvoke BedrockTransport = "OpenAIInvoke"
 )
 
 type BedrockConfig struct {

@@ -34,6 +34,13 @@ pub enum BedrockTransport {
 	#[default]
 	Converse,
 	NativeMessages,
+	/// OpenAI-compatible `InvokeModel`/`InvokeModelWithResponseStream`:
+	/// the Runtime surface accepts the full OpenAI Chat Completions envelope
+	/// (`temperature`, `reasoning_effort`, tools) and reports per-class token
+	/// details — the transport for OpenWeight models whose Converse surface
+	/// cannot serve them (first target: Moonshot Kimi K3.1). Runtime-only;
+	/// never resolves onto Mantle, never falls back to Converse.
+	OpenAIInvoke,
 }
 
 impl BedrockTransport {
@@ -41,6 +48,7 @@ impl BedrockTransport {
 		match self {
 			BedrockTransport::Converse => "converse",
 			BedrockTransport::NativeMessages => "native-messages",
+			BedrockTransport::OpenAIInvoke => "openai-invoke",
 		}
 	}
 }
@@ -118,11 +126,12 @@ impl Provider {
 		use BedrockEndpoint::{Mantle, Runtime};
 		use BedrockEndpointPreference::*;
 
-		// The native Messages transport is defined against Bedrock Runtime
-		// InvokeModel APIs only. Never resolve it onto Mantle, whatever the
-		// endpoint preference says — a misconfigured combination must stay on
-		// the documented Runtime surface rather than silently changing service.
-		if self.transport == BedrockTransport::NativeMessages {
+		// The InvokeModel transports (native Messages, OpenAIInvoke) are
+		// defined against Bedrock Runtime InvokeModel APIs only. Never resolve
+		// them onto Mantle, whatever the endpoint preference says — a
+		// misconfigured combination must stay on the documented Runtime
+		// surface rather than silently changing service.
+		if self.transport != BedrockTransport::Converse {
 			return Runtime;
 		}
 
@@ -174,6 +183,15 @@ impl Provider {
 				// has no Responses→Messages conversion, and failing closed to
 				// the proven Converse translation beats advertising a gap).
 				vec![ChatFormat::AnthropicMessages, ChatFormat::BedrockConverse]
+			},
+			BedrockEndpoint::Runtime if self.transport == BedrockTransport::OpenAIInvoke => {
+				// OpenAIInvoke transport: the ONLY upstream surface is the
+				// OpenAI Chat Completions body over Runtime InvokeModel.
+				// Every client format (Completions, Messages, Responses) is
+				// served THROUGH the OpenAI-completions translation matrix —
+				// advertising BedrockConverse here would silently downgrade a
+				// configured OpenAIInvoke backend to Converse (fail-open).
+				vec![ChatFormat::OpenAICompletions]
 			},
 			BedrockEndpoint::Runtime => vec![ChatFormat::BedrockConverse],
 			BedrockEndpoint::Mantle => {
@@ -234,6 +252,20 @@ impl Provider {
 			// guarantees the rendered body is the native Anthropic Messages
 			// payload (never a Converse body).
 			super::RouteType::Messages if self.transport == BedrockTransport::NativeMessages => {
+				if streaming {
+					strng::format!("/model/{model}/invoke-with-response-stream")
+				} else {
+					strng::format!("/model/{model}/invoke")
+				}
+			},
+			// OpenAIInvoke transport: chat rides the Runtime InvokeModel APIs
+			// with the OpenAI Chat Completions body (upstream_route_type is
+			// RouteType::Completions, derived from the OpenAICompletions chat
+			// translation; Messages is kept in the guard for defensive
+			// symmetry). No converse path may ever be selected.
+			super::RouteType::Completions | super::RouteType::Messages
+				if self.transport == BedrockTransport::OpenAIInvoke =>
+			{
 				if streaming {
 					strng::format!("/model/{model}/invoke-with-response-stream")
 				} else {
