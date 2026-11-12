@@ -292,6 +292,17 @@ impl OutboundCallSubtype {
 	}
 }
 
+/// One upstream attempt to an LLM provider. `endpoint` is the dialed provider `host:port`, which
+/// comes from configuration; non-LLM backends are not recorded. `outcome` is the response status
+/// code or a fixed transport-error class. `retried` marks attempts followed by another attempt.
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct UpstreamAttemptLabels {
+	pub backend: DefaultedUnknown<RichStrng>,
+	pub endpoint: DefaultedUnknown<RichStrng>,
+	pub outcome: DefaultedUnknown<RichStrng>,
+	pub retried: bool,
+}
+
 #[derive(Copy, Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct OutboundCallLabels {
 	pub kind: OutboundCallKind,
@@ -371,6 +382,8 @@ pub struct Metrics {
 
 	// metrics for request retries
 	pub retries: Counter,
+	// Per-attempt upstream outcomes, including attempts that were retried or failed over.
+	pub upstream_attempts: Family<UpstreamAttemptLabels, counter::Counter>,
 
 	// Number of requests currently waiting for a Substrate actor to become routable.
 	pub substrate_request_parking_active: Gauge,
@@ -712,6 +725,11 @@ impl Metrics {
 				&mut registry,
 				"retries",
 				"The total number of request retries",
+			),
+			upstream_attempts: build(
+				&mut registry,
+				"upstream_attempts",
+				"The total number of upstream attempts by endpoint and outcome, including retried attempts",
 			),
 		}
 	}
