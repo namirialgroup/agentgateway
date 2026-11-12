@@ -4168,6 +4168,7 @@ mod native_transport_tests {
 		// provably 5m-class.
 		request.transport_hints = llm::TransportHints {
 			bedrock_native_messages: true,
+			bedrock_openai_invoke: false,
 			cache_1h_requested: false,
 		};
 		assert!(provable_5m_write_split(Some(&request), &ctx));
